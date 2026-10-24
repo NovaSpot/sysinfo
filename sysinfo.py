@@ -8,6 +8,7 @@
                                 hidden as a spoiler; reveal it with a click or `p`)
     sysinfo.py --disk sda       start the Storage tile on a specific drive
     sysinfo.py --no-mouse       don't capture the mouse (keeps normal text selection)
+    sysinfo.py --ping-host 1.1.1.1   also show latency to that host (gateway ping is always on)
 
 Live mode controls:
     mouse wheel      scroll the tile under the pointer (Processes, Peripherals;
@@ -38,6 +39,7 @@ import select
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -871,7 +873,8 @@ def battery_info():
                 now=now, full=full, rate=rate,
                 kernel_left=kernel_left if kernel_left and kernel_left > 0 else None,
                 health=full / design * 100 if full and design else None,
-                cycles=fnum(read(b + "/cycle_count")))
+                cycles=fnum(read(b + "/cycle_count")),
+                limit=fnum(read(b + "/charge_control_end_threshold")))
 
 
 def battery_eta(b, rates):
@@ -968,6 +971,101 @@ def failed_units():
             if f:
                 names.append(f[0])
     return names if got else None
+
+
+def power_profile():
+    """power-saver / balanced / performance via power-profiles-daemon, else the ACPI platform profile."""
+    out = run(["powerprofilesctl", "get"])
+    if out and out.strip():
+        return out.strip()
+    return read("/sys/firmware/acpi/platform_profile") or None
+
+
+def gateway_for(iface):
+    for line in (read("/proc/net/route", "") or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) > 7 and f[0] == iface and f[1] == "00000000" and int(f[3], 16) & 2:
+            return socket.inet_ntoa(struct.pack("<L", int(f[2], 16)))
+    return None
+
+
+def ping_ms(host):
+    out = run(["ping", "-c", "1", "-W", "1", host], timeout=3)
+    m = re.search(r"time[=<]([\d.]+)\s*ms", out or "")
+    return float(m.group(1)) if m else None
+
+
+def ping_info(iface, host):
+    gw = gateway_for(iface) if iface else None
+    return dict(gw_ip=gw, gw=ping_ms(gw) if gw else None,
+                host=host, net=ping_ms(host) if host else None)
+
+
+WEAR_ATTRS = ("Wear_Leveling_Count", "Media_Wearout_Indicator", "SSD_Life_Left",
+              "Percent_Lifetime_Remain")
+
+
+def smart_info(dev):
+    """Drive health via smartctl's JSON output. Tries plain first, then `sudo -n` (which only
+    works if you allowed it without a password). Returns 'missing', None, or a dict."""
+    exe = which("smartctl")
+    if not exe:
+        return "missing"
+    path = f"/dev/{dev}"
+    for cmd in ([exe, "-j", "-a", path], ["sudo", "-n", exe, "-j", "-a", path]):
+        res = run_rc(cmd, timeout=8)
+        if not res:
+            continue
+        try:
+            data = json.loads(res[1])
+        except ValueError:
+            continue
+        nv = data.get("nvme_smart_health_information_log")
+        ok = (data.get("smart_status") or {}).get("passed")
+        if nv is None and ok is None:
+            continue                       # permission denied still yields JSON, but no health data
+        info = dict(ok=ok, used=None, spare=None, written=None, crit=0,
+                    hours=(data.get("power_on_time") or {}).get("hours"))
+        if nv:
+            info["used"] = nv.get("percentage_used")
+            info["spare"] = nv.get("available_spare")
+            units = nv.get("data_units_written")
+            info["written"] = units * 512000 / 1e12 if units is not None else None
+            info["crit"] = nv.get("critical_warning") or 0
+            if info["hours"] is None:
+                info["hours"] = nv.get("power_on_hours")
+        else:
+            for a in (data.get("ata_smart_attributes") or {}).get("table", []):
+                name = a.get("name", "")
+                if name in WEAR_ATTRS and info["used"] is None:
+                    info["used"] = max(0, 100 - a.get("value", 100))
+                elif name == "Total_LBAs_Written" and info["written"] is None:
+                    raw = (a.get("raw") or {}).get("value")
+                    if raw:
+                        info["written"] = raw * 512 / 1e12
+        return info
+    return None
+
+
+def smart_all(c):
+    res = {}
+    for d in list(c.disks):
+        if d["name"].startswith("mmcblk"):
+            continue
+        r = smart_info(d["name"])
+        if r == "missing":
+            return {"_missing": True}
+        res[d["name"]] = r
+    return res
+
+
+def lat_text(label, ms):
+    t = Text(f"{label} ", style=T["muted"])
+    if ms is None:
+        t.append("timeout", style=T["crit"])
+    else:
+        t.append(f"{ms:.0f} ms" if ms >= 10 else f"{ms:.1f} ms", style=scolor(ms, 30, 100))
+    return t
 
 
 def reboot_required():
@@ -1074,7 +1172,7 @@ class Keys:
 # Collector: keeps history and refreshes slow data in background threads
 # --------------------------------------------------------------------------- #
 class Collector:
-    def __init__(self, public_ip=False):
+    def __init__(self, public_ip=False, ping_host=None):
         self.cpu = 0.0
         self.cpu_hist = deque(maxlen=120)
         self.down_hist = deque(maxlen=120)
@@ -1112,6 +1210,7 @@ class Collector:
         self._slow = {}
         self._slow_t = {}
         self.public_ip = public_ip
+        self.ping_host = ping_host
         self.slow_jobs = {
             "gpu": (gpu_info, 2), "audio": (audio_info, 3), "bt": (bluetooth_devices, 10),
             "usb": (usb_devices, 5), "display": (display_info, 15), "ssid": (wifi_ssid, 10),
@@ -1121,9 +1220,12 @@ class Collector:
             "vpn": (vpn_info, 10),
             "monmode": (lambda: wifi_monitor_support(self.iface), 60),
             "sensors": (self._sensors, 2), "reboot": (reboot_required, 30),
+            "profile": (power_profile, 10), "smart": (lambda: smart_all(self), 600),
         }
         if which("systemctl"):
             self.slow_jobs["services"] = (failed_units, 30)
+        if which("ping"):
+            self.slow_jobs["ping"] = (lambda: ping_info(self.iface, self.ping_host), 5)
         if UPDATES_SUPPORTED:
             self.slow_jobs["updates"] = (pending_updates, 1800)
         if public_ip:
@@ -1544,6 +1646,35 @@ def tile_storage(c, w):
         row.append(f"  {dt:.0f}°C", style=scolor(dt, 70, 80))
         level = max(level, sev(dt, 70, 80))
     lines.append(kv("Drive", row, w))
+    sm = c.get("smart")
+    if sm is LOADING:
+        lines.append(kv("Health", "checking…", w, "faint"))
+    elif isinstance(sm, dict) and sm.get("_missing"):
+        lines.append(kv("Health", "install smartmontools", w, "faint"))
+    else:
+        h = sm.get(d["name"]) if isinstance(sm, dict) else None
+        if not h:
+            lines.append(kv("Health", "n/a · needs root", w, "faint"))
+        else:
+            ok = h.get("ok")
+            t = (txt("PASSED", "ok") if ok else txt("FAILED", "crit", bold=True)) \
+                if ok is not None else txt("unknown", "faint")
+            if ok is False or h.get("crit"):
+                level = 2
+            if h.get("used") is not None:
+                t.append(f"  {h['used']:.0f}% worn", style=scolor(h["used"], 70, 90))
+                level = max(level, sev(h["used"], 70, 90))
+            if h.get("spare") is not None and h["spare"] < 20:
+                t.append(f"  spare {h['spare']}%", style=T["warn"])
+                level = max(level, 1)
+            lines.append(kv("Health", t, w))
+            bits = []
+            if h.get("written") is not None:
+                bits.append(f"{h['written']:.1f} TBW")
+            if h.get("hours") is not None:
+                bits.append(f"{h['hours']:,} h")
+            if bits:
+                lines.append(kv("Usage", " · ".join(bits), w))
     # A nearly full drive you aren't looking at should still light up the border.
     for o in c.disks:
         if o is d:
@@ -1621,6 +1752,16 @@ def tile_network(c, w):
             lines.append(kv("VPN", t, w))
         else:
             lines.append(kv("VPN", "off", w, "faint"))
+    if "ping" in c.slow_jobs:
+        pg = c.get("ping")
+        if pg is LOADING:
+            lines.append(kv("Ping", "…", w, "faint"))
+        elif pg:
+            t = lat_text("gw", pg["gw"]) if pg["gw_ip"] else txt("no gateway", "faint")
+            if pg["host"]:
+                t.append("  ")
+                t.append_text(lat_text("net", pg["net"]))
+            lines.append(kv("Ping", t, w))
     lines.append(rate_row("↓", c.down_hist, c.down, "blue", w))
     lines.append(rate_row("↑", c.up_hist, c.up, "peach", w))
     if c.net_total:
@@ -1657,6 +1798,11 @@ def tile_os(c, w):
              kv("DE", de, w)]
     if pkgs not in (None, LOADING):
         lines.append(kv("Pkgs", pkgs, w))
+    prof = c.get("profile")
+    if prof not in (None, LOADING):
+        col = {"performance": "warn", "balanced": "bright",
+               "power-saver": "ok", "low-power": "ok"}.get(prof, "bright")
+        lines.append(kv("Profile", prof, w, col))
     level = 0
     if "updates" in c.slow_jobs:
         up = c.get("updates")
@@ -1818,6 +1964,9 @@ def tile_battery(c, w):
         lines.append(kv("Health", txt(f"{b['health']:.0f}%", scolor(100 - b["health"], 20, 35)), w))
     if b["cycles"] is not None:
         lines.append(kv("Cycles", f"{b['cycles']:.0f}", w))
+    if b.get("limit") is not None:
+        lim = b["limit"]
+        lines.append(kv("Limit", txt("none", "faint") if lim >= 100 else txt(f"{lim:.0f}% cap", "ok"), w))
     level = 2 if (pct <= 15 and status == "Discharging") else 1 if (pct <= 30 and status == "Discharging") else 0
     return lines, level
 
@@ -1974,6 +2123,9 @@ def main():
     ap.add_argument("--public-ip", action="store_true",
                     help="look up public IP via api.ipify.org at start and show it "
                          "(default: hidden, looked up only when you reveal it)")
+    ap.add_argument("--ping-host", metavar="HOST",
+                    help="also ping this host (e.g. 1.1.1.1) and show its latency; "
+                         "off by default, the gateway is always pinged")
     ap.add_argument("--no-mouse", action="store_true",
                     help="don't capture the mouse (normal text selection; scroll with j/k)")
     args = ap.parse_args()
@@ -1982,7 +2134,7 @@ def main():
     T.update(THEMES[args.theme])
 
     console = Console()
-    c = Collector(public_ip=args.public_ip)
+    c = Collector(public_ip=args.public_ip, ping_host=args.ping_host)
     c.disk_sel = args.disk
 
     if args.once or not sys.stdout.isatty():
