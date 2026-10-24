@@ -5,17 +5,25 @@
     sysinfo.py --once           print one snapshot and exit
     sysinfo.py -i 1 --theme tokyo
     sysinfo.py --public-ip      also look up your public IP (off by default)
+    sysinfo.py --disk sda       start the Storage tile on a specific drive
+
+Keys (live mode):  [ and ]  (or Tab / arrow keys)  switch drive in the Storage tile,
+                   q or Ctrl+C quits.
 
 Dependencies (Debian):  sudo apt install python3-rich python3-psutil
+Optional tools that unlock more info: iw (Wi-Fi monitor-mode support), resolvectl,
+nmcli, gdbus (GNOME display scale), lspci, nvidia-smi.
 """
 from __future__ import annotations
 
 import argparse
 import getpass
 import glob
+import json
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -26,6 +34,7 @@ import time
 import urllib.request
 from collections import deque
 from datetime import datetime
+from functools import lru_cache
 
 try:
     import psutil
@@ -288,6 +297,28 @@ def cpu_temp():
     return None
 
 
+@lru_cache(maxsize=1)
+def cpu_flags():
+    for line in (read("/proc/cpuinfo", "") or "").splitlines():
+        if line.startswith(("flags", "Features")):
+            return frozenset(line.split(":", 1)[1].split())
+    return frozenset()
+
+
+def virt_support():
+    """Hardware virtualization support: VT-x / AMD-V flag, KVM device, IOMMU, or 'inside a VM'."""
+    flags = cpu_flags()
+    iommu = False
+    try:
+        iommu = bool(os.listdir("/sys/class/iommu"))
+    except OSError:
+        pass
+    return dict(hw="VT-x" if "vmx" in flags else "AMD-V" if "svm" in flags else None,
+                kvm=os.path.exists("/dev/kvm"),
+                kvm_ok=os.access("/dev/kvm", os.R_OK | os.W_OK),
+                iommu=iommu, in_vm="hypervisor" in flags)
+
+
 def secure_boot():
     for p in glob.glob("/sys/firmware/efi/efivars/SecureBoot-*"):
         try:
@@ -364,18 +395,85 @@ def gpu_info():
     return max(found, key=lambda i: (i["vram"][1] if i["vram"] else 0))
 
 
+# ---- network -------------------------------------------------------------- #
+VPN_RE = re.compile(r"^(tun|wg|ppp|tailscale|zt|nordlynx|proton|mullvad|ipsec|vpn|utun|cscotun)", re.I)
+
+
+def is_vpn_iface(name):
+    """Tunnel interfaces: known VPN names, or L3 devices with no link layer (type 65534)."""
+    return bool(VPN_RE.match(name)) or read(f"/sys/class/net/{name}/type") == "65534"
+
+
 def default_iface():
+    """The physical interface carrying the default route (a VPN tunnel is skipped, so the
+    Network tile keeps describing your real Wi-Fi / Ethernet link)."""
+    routes = []
     for line in (read("/proc/net/route", "") or "").splitlines()[1:]:
         f = line.split()
-        if len(f) > 3 and f[1] == "00000000" and int(f[3], 16) & 2:
-            return f[0]
+        if len(f) > 6 and f[1] == "00000000" and int(f[3], 16) & 2:
+            routes.append((int(f[6]), f[0]))
+    routes.sort()
+    for _, name in routes:
+        if not is_vpn_iface(name):
+            return name
+    if routes:
+        return routes[0][1]
     try:
         for name, st in psutil.net_if_stats().items():
-            if st.isup and name != "lo":
+            if st.isup and name != "lo" and not is_vpn_iface(name):
                 return name
     except Exception:
         pass
     return None
+
+
+def vpn_info():
+    """Active VPN connections: NetworkManager names when available, tunnel interfaces otherwise."""
+    names = []
+    out = run(["nmcli", "-t", "-f", "TYPE,NAME", "connection", "show", "--active"], timeout=2)
+    for ln in (out or "").splitlines():
+        kind, _, name = ln.partition(":")
+        if kind in ("vpn", "wireguard") and name:
+            names.append(name)
+    try:
+        stats = psutil.net_if_stats()
+    except Exception:
+        stats = {}
+    ifaces = [n for n, s in stats.items() if s.isup and n != "lo" and is_vpn_iface(n)]
+    return dict(active=bool(names or ifaces), names=names or ifaces)
+
+
+def dns_servers(iface):
+    servers = []
+    if iface:
+        out = run(["resolvectl", "dns", iface])
+        m = re.search(r"\):\s*(.*)$", (out or "").strip())
+        if m:
+            servers = [t.split("%")[0] for t in m.group(1).split()]
+    if not servers:
+        for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+            text = read(path)
+            if text:
+                servers = [ln.split()[1] for ln in text.splitlines()
+                           if ln.startswith("nameserver") and len(ln.split()) > 1]
+                if servers:
+                    break
+    return servers
+
+
+def wifi_monitor_support(iface):
+    """True/False if the Wi-Fi driver advertises monitor mode, None if it can't be determined.
+    Needs the `iw` tool. This is a capability check only; it says nothing about injection."""
+    if not iface:
+        return None
+    phy = read(f"/sys/class/net/{iface}/phy80211/name")
+    if not phy:
+        return None
+    out = run(["iw", "phy", phy, "info"], timeout=2)
+    if not out:
+        return None
+    m = re.search(r"Supported interface modes:\n((?:[ \t]+\*.*\n)+)", out)
+    return ("monitor" in m.group(1)) if m else None
 
 
 def wifi_signal(iface):
@@ -419,44 +517,95 @@ def fetch_public_ip():
         return r.read().decode().strip()
 
 
-def root_drive():
-    dev = fstype = None
-    for p in psutil.disk_partitions(all=False):
-        if p.mountpoint == "/":
-            dev, fstype = p.device, p.fstype
-    if not dev:
-        return None
-    name = os.path.basename(os.path.realpath(dev))
-    for _ in range(4):
-        parent = (run(["lsblk", "-no", "pkname", "/dev/" + name]) or "").split()
-        if not parent:
-            break
-        name = parent[0]
-    base = f"/sys/block/{name}"
-    model = read(base + "/device/model")
-    sectors = fnum(read(base + "/size"))
-    if name.startswith("nvme"):
-        kind = "NVMe SSD"
-    else:
-        kind = "HDD" if read(base + "/queue/rotational") == "1" else "SSD"
-    return dict(model=re.sub(r"\s+", " ", model) if model else None,
-                size=human_size(sectors * 512).replace("B", "") + "B" if sectors else None,
-                kind=kind if os.path.exists(base) else None, fstype=fstype,
-                dev=name if os.path.exists(base) else None)
+# ---- storage -------------------------------------------------------------- #
+DISK_RE = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|mmcblk\d+)$")
 
 
 def list_mounts():
     seen = {}
     for p in psutil.disk_partitions(all=False):
+        mp = p.mountpoint
         if (p.fstype in ("squashfs", "iso9660") or p.device.startswith("/dev/loop")
-                or p.mountpoint.startswith(("/snap", "/var/snap", "/var/lib/docker", "/run"))):
+                or mp.startswith(("/snap", "/var/snap", "/var/lib/docker"))
+                or (mp.startswith("/run") and not mp.startswith("/run/media"))):
             continue
-        if p.device in seen and len(p.mountpoint) >= len(seen[p.device].mountpoint):
+        if p.device in seen and len(mp) >= len(seen[p.device].mountpoint):
             continue
         seen[p.device] = p
     return sorted(seen.values(), key=lambda p: (p.mountpoint != "/", p.mountpoint))
 
 
+def disk_of(name, depth=0):
+    """Physical disk behind a block device: partitions climb to their parent,
+    LUKS/LVM/RAID layers follow their slaves."""
+    p = f"/sys/class/block/{name}"
+    if not os.path.exists(p):
+        return None
+    if os.path.exists(p + "/partition"):
+        return os.path.basename(os.path.dirname(os.path.realpath(p)))
+    if depth < 4 and os.path.isdir(p + "/slaves"):
+        for s in sorted(os.listdir(p + "/slaves")):
+            r = disk_of(s, depth + 1)
+            if r:
+                return r
+    return name if os.path.exists(p + "/device") else None
+
+
+def list_disks():
+    """Physical drives (root drive first), each with its model, size, kind and mounted partitions."""
+    by_disk, root_disk = {}, None
+    for p in list_mounts():
+        d = disk_of(os.path.basename(os.path.realpath(p.device)))
+        if d is None:
+            continue
+        by_disk.setdefault(d, []).append(p)
+        if p.mountpoint == "/":
+            root_disk = d
+    disks = []
+    for path in sorted(glob.glob("/sys/block/*")):
+        name = os.path.basename(path)
+        if not DISK_RE.match(name):
+            continue
+        sectors = fnum(read(path + "/size")) or 0
+        if sectors <= 0:
+            continue
+        model = read(path + "/device/model")
+        if name.startswith("nvme"):
+            kind = "NVMe SSD"
+        elif name.startswith("mmcblk"):
+            kind = "SD / eMMC"
+        else:
+            kind = "HDD" if read(path + "/queue/rotational") == "1" else "SSD"
+        try:
+            nparts = len([x for x in os.listdir(path) if os.path.exists(f"{path}/{x}/partition")])
+        except OSError:
+            nparts = 0
+        disks.append(dict(name=name, model=re.sub(r"\s+", " ", model) if model else None,
+                          size=sectors * 512, kind=kind, usb="/usb" in os.path.realpath(path),
+                          nparts=nparts, mounts=by_disk.get(name, []), is_root=(name == root_disk)))
+    disks.sort(key=lambda d: (not d["is_root"], d["name"]))
+    return disks
+
+
+def mount_label(mp):
+    mp = "/efi" if mp == "/boot/efi" else mp
+    return mp if len(mp) < LABEL_W else "…" + mp[-(LABEL_W - 2):]
+
+
+def drive_temp(dev):
+    """Temperature of a block device (NVMe, or SATA with the drivetemp module), in °C."""
+    if not dev:
+        return None
+    for pat in (f"/sys/block/{dev}/device/hwmon*/temp1_input",
+                f"/sys/block/{dev}/device/hwmon/hwmon*/temp1_input"):
+        for t in glob.glob(pat):
+            v = fnum(read(t))
+            if v is not None:
+                return v / 1000
+    return None
+
+
+# ---- misc ----------------------------------------------------------------- #
 def count_packages():
     if os.path.exists("/var/lib/dpkg/status"):
         n = 0
@@ -544,6 +693,7 @@ def audio_info():
     return None
 
 
+# ---- display -------------------------------------------------------------- #
 PNP = {"BOE": "BOE", "AUO": "AUO", "LGD": "LG Display", "SDC": "Samsung Display",
        "SAM": "Samsung", "DEL": "Dell", "GSM": "LG", "ACR": "Acer", "AOC": "AOC",
        "AUS": "ASUS", "BNQ": "BenQ", "HWP": "HP", "LEN": "Lenovo", "CMN": "Innolux",
@@ -564,6 +714,60 @@ def parse_edid(b):
     return PNP.get(code, code), name
 
 
+def brightness():
+    """Backlight level in %, from the backlight device with the finest scale. None on desktops."""
+    best = None
+    for d in sorted(glob.glob("/sys/class/backlight/*")):
+        cur, mx = fnum(read(d + "/brightness")), fnum(read(d + "/max_brightness"))
+        if cur is not None and mx and (best is None or mx > best[1]):
+            best = (cur, mx)
+    return best[0] / best[1] * 100 if best else None
+
+
+def display_scales():
+    """Output name -> scale factor (1.0 = 100%). Tries GNOME (Mutter), KDE, Sway, Hyprland,
+    then falls back to the X11 DPI / GDK_SCALE as a single '_global' value."""
+    res = {}
+    out = run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.DisplayConfig",
+               "--object-path", "/org/gnome/Mutter/DisplayConfig",
+               "--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState"], timeout=2)
+    if out:
+        for m in re.finditer(r"\((-?\d+), (-?\d+), ([\d.]+), uint32 \d+, (?:true|false), \[\('([^']+)'", out):
+            res[m.group(4)] = float(m.group(3))
+        if res:
+            return res
+    out = run(["kscreen-doctor", "-o"], timeout=2)
+    if out:
+        cur = None
+        for line in re.sub(r"\x1b\[[0-9;]*m", "", out).splitlines():
+            m = re.match(r"\s*Output:\s+\d+\s+(\S+)", line)
+            if m:
+                cur = m.group(1)
+            m = re.match(r"\s*Scale:\s*([\d.]+)", line)
+            if m and cur:
+                res[cur] = float(m.group(1))
+        if res:
+            return res
+    for cmd in (["swaymsg", "-t", "get_outputs", "-r"], ["hyprctl", "monitors", "-j"]):
+        out = run(cmd, timeout=2)
+        if not out:
+            continue
+        try:
+            for o in json.loads(out):
+                if o.get("scale") and o.get("name"):
+                    res[o["name"]] = float(o["scale"])
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if res:
+            return res
+    if os.environ.get("DISPLAY"):
+        m = re.search(r"Xft\.dpi:\s*(\d+)", run(["xrdb", "-query"]) or "")
+        if m:
+            return {"_global": float(m.group(1)) / 96}
+    gdk = fnum(os.environ.get("GDK_SCALE"))
+    return {"_global": gdk} if gdk else {}
+
+
 def display_info():
     rates = {}
     if os.environ.get("DISPLAY"):
@@ -577,6 +781,7 @@ def display_info():
                     if "*" in tok:
                         rates[cur] = fnum(tok.strip("*+"))
                         break
+    scales = display_scales()
     mons = []
     for st in sorted(glob.glob("/sys/class/drm/card*-*/status")):
         if read(st) != "connected":
@@ -594,11 +799,15 @@ def display_info():
         if rate is None and len(rates) == 1:
             rate = next(iter(rates.values()))
         mons.append(dict(name=name, mode=modes[0] if modes else None, rate=rate,
-                         vendor=vendor, model=model))
+                         vendor=vendor, model=model,
+                         scale=scales.get(name) or scales.get("_global")))
     return mons
 
 
+# ---- battery -------------------------------------------------------------- #
 def battery_info():
+    """Raw battery readings. `rate` is power (µW) when the battery reports energy, or current (µA)
+    when it reports charge, always in the same unit as `now` / `full`."""
     bats = sorted(glob.glob("/sys/class/power_supply/BAT*"))
     if not bats:
         return None
@@ -609,30 +818,42 @@ def battery_info():
     status = read(b + "/status", "Unknown")
     volt = fnum(read(b + "/voltage_now"))
     power = fnum(read(b + "/power_now"))
-    if power is not None:
-        watts = power / 1e6
+    current = fnum(read(b + "/current_now"))
+    if power is None and current is not None and volt is not None:
+        power = abs(current) * volt / 1e6
+    en, ef = fnum(read(b + "/energy_now")), fnum(read(b + "/energy_full"))
+    if en is not None and ef is not None:
+        now, full, rate = en, ef, (abs(power) if power else None)
+        design = fnum(read(b + "/energy_full_design"))
     else:
-        cur = fnum(read(b + "/current_now"))
-        watts = cur * volt / 1e12 if cur is not None and volt is not None else None
-    left = None
-    try:
-        sb = psutil.sensors_battery()
-        if sb and sb.secsleft and sb.secsleft > 0:
-            left = sb.secsleft
-    except Exception:
-        pass
-    if left is None and watts:
-        en, ef = fnum(read(b + "/energy_now")), fnum(read(b + "/energy_full"))
-        if en is not None and ef is not None:
-            left = (en if status == "Discharging" else ef - en) / (watts * 1e6) * 3600
-    full, design = fnum(read(b + "/energy_full")), fnum(read(b + "/energy_full_design"))
-    if full is None or design is None:
-        full, design = fnum(read(b + "/charge_full")), fnum(read(b + "/charge_full_design"))
-    return dict(pct=cap, status=status, watts=watts, left=left,
+        now, full = fnum(read(b + "/charge_now")), fnum(read(b + "/charge_full"))
+        rate = abs(current) if current else None
+        design = fnum(read(b + "/charge_full_design"))
+    kernel_left = fnum(read(b + ("/time_to_full_now" if status == "Charging" else "/time_to_empty_now")))
+    return dict(pct=cap, status=status, watts=power / 1e6 if power else None,
+                now=now, full=full, rate=rate,
+                kernel_left=kernel_left if kernel_left and kernel_left > 0 else None,
                 health=full / design * 100 if full and design else None,
                 cycles=fnum(read(b + "/cycle_count")))
 
 
+def battery_eta(b, rates):
+    """Seconds until full (charging) or empty (discharging), smoothed over recent samples.
+    Charging estimates run optimistic near 100% because the charger tapers off."""
+    if not b or b["status"] not in ("Charging", "Discharging"):
+        return None
+    if b["kernel_left"]:
+        return b["kernel_left"]
+    if b["now"] is None or b["full"] is None or not rates:
+        return None
+    rate = sum(rates) / len(rates)
+    remaining = (b["full"] - b["now"]) if b["status"] == "Charging" else b["now"]
+    if rate <= 0 or remaining <= 0:
+        return None
+    return remaining / rate * 3600
+
+
+# ---- sensors / system health ---------------------------------------------- #
 def read_pressure(kind="memory"):
     """Pressure-stall info from /proc/pressure/<kind> (avg10, in %): {'some': x, 'full': y}.
     None when the kernel has PSI disabled or doesn't provide it."""
@@ -650,23 +871,6 @@ def read_pressure(kind="memory"):
     return res or None
 
 
-def disk_io_totals():
-    """(read_bytes, write_bytes) summed over physical disks only, so partitions,
-    loop devices and dm/LVM layers aren't counted twice. None if unavailable."""
-    try:
-        per = psutil.disk_io_counters(perdisk=True)
-    except Exception:
-        return None
-    r = w = 0
-    found = False
-    for name, st in (per or {}).items():
-        if os.path.exists(f"/sys/block/{name}/device"):
-            r += st.read_bytes
-            w += st.write_bytes
-            found = True
-    return (r, w) if found else None
-
-
 def fan_speeds():
     fn = getattr(psutil, "sensors_fans", None)
     try:
@@ -674,23 +878,6 @@ def fan_speeds():
     except Exception:
         return []
     return [e.current for entries in (data or {}).values() for e in entries]
-
-
-def drive_temp(dev):
-    """Temperature of a block device (NVMe, or SATA with the drivetemp module), in °C."""
-    if not dev:
-        return None
-    for pat in (f"/sys/block/{dev}/device/hwmon*/temp1_input",
-                f"/sys/block/{dev}/device/hwmon/hwmon*/temp1_input"):
-        for t in glob.glob(pat):
-            v = fnum(read(t))
-            if v is not None:
-                return v / 1000
-    return None
-
-
-def sensor_data(dev):
-    return dict(fans=fan_speeds(), drive_temp=drive_temp(dev))
 
 
 def pending_updates():
@@ -765,6 +952,59 @@ def reboot_required():
 
 
 # --------------------------------------------------------------------------- #
+# Keyboard input (live mode only)
+# --------------------------------------------------------------------------- #
+_KEY_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|.", re.S)
+_KEYMAP = {"]": "next", ".": "next", "\t": "next", "\x1b[C": "next", "\x1bOC": "next",
+           "[": "prev", ",": "prev", "\x1b[Z": "prev", "\x1b[D": "prev", "\x1bOD": "prev",
+           "q": "quit", "Q": "quit"}
+
+
+def parse_keys(data):
+    return [_KEYMAP[t] for t in _KEY_RE.findall(data) if t in _KEYMAP]
+
+
+class Keys:
+    """Non-blocking key reader. Uses cbreak mode, so Ctrl+C still raises KeyboardInterrupt,
+    and always restores the terminal on exit."""
+
+    def __init__(self):
+        self.fd = None
+        self._old = None
+
+    @property
+    def active(self):
+        return self.fd is not None
+
+    def __enter__(self):
+        try:
+            if sys.stdin.isatty():
+                import termios
+                import tty
+                self.fd = sys.stdin.fileno()
+                self._old = termios.tcgetattr(self.fd)
+                tty.setcbreak(self.fd)
+        except Exception:
+            self.fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old)
+
+    def wait(self, timeout):
+        """Wait up to `timeout` seconds; return a list of 'next' / 'prev' / 'quit' events."""
+        if self.fd is None:
+            time.sleep(max(timeout, 0))
+            return []
+        ready, _, _ = select.select([self.fd], [], [], max(timeout, 0))
+        if not ready:
+            return []
+        return parse_keys(os.read(self.fd, 64).decode("utf-8", "ignore"))
+
+
+# --------------------------------------------------------------------------- #
 # Collector: keeps history and refreshes slow data in background threads
 # --------------------------------------------------------------------------- #
 class Collector:
@@ -777,13 +1017,15 @@ class Collector:
         self.iface = None
         self.net_total = None
         self._net_last = None
-        self.disk_r_hist = deque(maxlen=120)
-        self.disk_w_hist = deque(maxlen=120)
-        self.disk_r = self.disk_w = 0.0
-        self.has_disk_io = False
-        self._disk_last = None
+        self.disks = []
+        self.disk_sel = None
+        self.disk_io = {}
         self.swap_in = self.swap_out = 0.0
         self._swap_last = None
+        self.battery = None
+        self.batt_eta = None
+        self.rate_hist = deque(maxlen=20)
+        self._batt_status = None
         self.top = []
         self.ntasks = 0
         self.cpu_name = cpu_model()
@@ -794,8 +1036,11 @@ class Collector:
         self.slow_jobs = {
             "gpu": (gpu_info, 2), "audio": (audio_info, 3), "bt": (bluetooth_devices, 10),
             "usb": (usb_devices, 5), "display": (display_info, 15), "ssid": (wifi_ssid, 10),
-            "drive": (root_drive, 120), "pkgs": (count_packages, 3600),
-            "shell": (shell_name, 3600), "nic": (lambda: nic_vendor(self.iface), 60),
+            "pkgs": (count_packages, 3600), "shell": (shell_name, 3600),
+            "nic": (lambda: nic_vendor(self.iface), 60),
+            "dns": (lambda: dns_servers(self.iface), 30),
+            "vpn": (vpn_info, 10),
+            "monmode": (lambda: wifi_monitor_support(self.iface), 60),
             "sensors": (self._sensors, 2), "reboot": (reboot_required, 30),
         }
         if shutil.which("systemctl"):
@@ -806,6 +1051,21 @@ class Collector:
             self.slow_jobs["pubip"] = (fetch_public_ip, 300)
         psutil.cpu_percent(None)
 
+    # -- drive selection (Storage tile) --
+    def selected_disk(self):
+        for d in self.disks:
+            if d["name"] == self.disk_sel:
+                return d
+        return self.disks[0] if self.disks else None
+
+    def cycle_disk(self, step):
+        cur = self.selected_disk()
+        if not cur or len(self.disks) < 2:
+            return
+        names = [d["name"] for d in self.disks]
+        self.disk_sel = names[(names.index(cur["name"]) + step) % len(names)]
+
+    # -- slow data --
     def get(self, key):
         return self._slow.get(key, LOADING)
 
@@ -820,8 +1080,7 @@ class Collector:
                     self._slow.setdefault(key, None)
 
     def _sensors(self):
-        d = self._slow.get("drive")
-        return sensor_data(d.get("dev") if isinstance(d, dict) else None)
+        return dict(fans=fan_speeds())
 
     def start_background(self):
         # One thread per job, so a slow one (apt, bluetoothctl...) never delays the others.
@@ -835,6 +1094,7 @@ class Collector:
         for key, (fn, ttl) in self.slow_jobs.items():
             threading.Thread(target=loop, args=(key, fn, ttl), daemon=True).start()
 
+    # -- fast data, sampled every refresh --
     def sample(self):
         self.cpu = psutil.cpu_percent(None)
         self.cpu_hist.append(self.cpu)
@@ -863,20 +1123,28 @@ class Collector:
             self.net_total = (counters.bytes_recv, counters.bytes_sent)
         else:
             self.net_total = None
-        io = disk_io_totals()
-        self.has_disk_io = io is not None
-        if io:
-            if self._disk_last:
-                t0, r0, w0 = self._disk_last
+        try:
+            self.disks = list_disks()
+        except Exception:
+            self.disks = []
+        try:
+            per = psutil.disk_io_counters(perdisk=True) or {}
+        except Exception:
+            per = {}
+        for d in self.disks:
+            st = per.get(d["name"])
+            if not st:
+                continue
+            e = self.disk_io.setdefault(d["name"], dict(last=None, r=0.0, w=0.0,
+                                                        rh=deque(maxlen=120), wh=deque(maxlen=120)))
+            if e["last"]:
+                t0, r0, w0 = e["last"]
                 dt = max(now - t0, 1e-3)
-                self.disk_r = max(io[0] - r0, 0) / dt
-                self.disk_w = max(io[1] - w0, 0) / dt
-                self.disk_r_hist.append(self.disk_r)
-                self.disk_w_hist.append(self.disk_w)
-            self._disk_last = (now, io[0], io[1])
-        else:
-            self._disk_last = None
-            self.disk_r = self.disk_w = 0.0
+                e["r"] = max(st.read_bytes - r0, 0) / dt
+                e["w"] = max(st.write_bytes - w0, 0) / dt
+                e["rh"].append(e["r"])
+                e["wh"].append(e["w"])
+            e["last"] = (now, st.read_bytes, st.write_bytes)
         try:
             sm = psutil.swap_memory()
             if self._swap_last:
@@ -887,6 +1155,18 @@ class Collector:
             self._swap_last = (now, sm.sin, sm.sout)
         except Exception:
             self._swap_last = None
+        try:
+            b = battery_info()
+        except Exception:
+            b = None
+        if b:
+            if b["status"] != self._batt_status:
+                self.rate_hist.clear()
+                self._batt_status = b["status"]
+            if b["rate"]:
+                self.rate_hist.append(b["rate"])
+        self.battery = b
+        self.batt_eta = battery_eta(b, self.rate_hist)
         procs = []
         for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
             i = p.info
@@ -899,8 +1179,8 @@ class Collector:
 
 
 # --------------------------------------------------------------------------- #
-# Tiles. Each returns (lines, level) where level 0/1/2 = ok/warn/crit border,
-# or None to hide the tile entirely (e.g. no battery on a desktop).
+# Tiles. Each returns (lines, level) or (lines, level, title_suffix), where level
+# 0/1/2 = ok/warn/crit border, or None to hide the tile entirely (e.g. no battery).
 # --------------------------------------------------------------------------- #
 def loading():
     return [txt("loading…", "faint")], 0
@@ -935,8 +1215,28 @@ def tile_machine(c, w):
         lines.append(kv("Sec.boot", "–", w, "faint"))
     else:
         lines.append(kv("Sec.boot", "ON" if sb else "OFF", w, "ok" if sb else "warn"))
-    if re.search(r"VirtualBox|VMware|QEMU|KVM|Bochs|Xen|Virtual Machine", f"{vendor_raw} {product}", re.I):
-        lines.append(kv("Virt", "VM", w, "blue"))
+    vs = virt_support()
+    in_vm = vs["in_vm"] or bool(re.search(
+        r"VirtualBox|VMware|QEMU|KVM|Bochs|Xen|Virtual Machine", f"{vendor_raw} {product}", re.I))
+    if in_vm:
+        t = txt("VM", "blue")
+        v = short_vendor(vendor_raw)
+        if v:
+            t.append(f"  {v}", style=T["muted"])
+        if vs["hw"]:
+            t.append(f"  nested {vs['hw']}", style=T["faint"])
+        lines.append(kv("Virt", t, w))
+    else:
+        if vs["hw"]:
+            t = txt(vs["hw"], "ok")
+            if vs["kvm"]:
+                t.append("  KVM ready" if vs["kvm_ok"] else "  KVM (no access)", style=T["muted"])
+            else:
+                t.append("  no /dev/kvm", style=T["faint"])
+        else:
+            t = txt("unavailable", "faint")
+        lines.append(kv("Virt", t, w))
+        lines.append(kv("IOMMU", txt("on", "ok") if vs["iommu"] else txt("off", "faint"), w))
     return lines, 0
 
 
@@ -1043,34 +1343,65 @@ def tile_ram(c, w):
 
 
 def tile_storage(c, w):
-    drive = c.get("drive")
-    lines, level = [], 0
-    if drive and drive.get("model"):
-        lines.append(split(txt(drive["model"], bold=True), txt(drive.get("size") or "", "muted"), w))
-    mounts = list_mounts()
-    for p in mounts[:4]:
+    d = c.selected_disk()
+    if d is None:
+        # No physical disks visible (containers, some VMs): fall back to a plain mount list.
+        lines, level = [], 0
+        for p in list_mounts()[:4]:
+            try:
+                u = psutil.disk_usage(p.mountpoint)
+            except OSError:
+                continue
+            lines.append(bar_row(mount_label(p.mountpoint), u.percent,
+                                 txt(f"{human_size(u.used)}/{human_size(u.total)}"), w))
+            level = max(level, sev(u.percent, 85, 95))
+        return (lines or [txt("no disks found", "faint")]), level
+    n = len(c.disks)
+    idx = [x["name"] for x in c.disks].index(d["name"])
+    suffix = d["name"] + (f"  {idx + 1}/{n}" if n > 1 else "")
+    lines = [split(txt(d["model"] or d["name"], bold=True), txt(f"{human_size(d['size'])}B", "muted"), w)]
+    level = 0
+    for p in d["mounts"][:3]:
         try:
             u = psutil.disk_usage(p.mountpoint)
         except OSError:
             continue
-        mp = "/efi" if p.mountpoint == "/boot/efi" else p.mountpoint
-        mp = mp if len(mp) < LABEL_W else "…" + mp[-(LABEL_W - 2):]
-        lines.append(bar_row(mp, u.percent, txt(f"{human_size(u.used)}/{human_size(u.total)}"), w))
+        lines.append(bar_row(mount_label(p.mountpoint), u.percent,
+                             txt(f"{human_size(u.used)}/{human_size(u.total)}"), w))
         level = max(level, sev(u.percent, 85, 95))
-    if len(mounts) > 4:
-        lines.append(txt(f"+{len(mounts) - 4} more", "faint"))
-    if c.has_disk_io:
-        lines.append(rate_row("R", c.disk_r_hist, c.disk_r, "teal", w))
-        lines.append(rate_row("W", c.disk_w_hist, c.disk_w, "mauve", w))
-    if drive and drive.get("kind"):
-        row = txt(f"{drive['kind']} · {drive['fstype']}")
-        sd = c.get("sensors")
-        dtemp = sd.get("drive_temp") if isinstance(sd, dict) else None
-        if dtemp is not None:
-            row.append(f"  {dtemp:.0f}°C", style=scolor(dtemp, 70, 80))
-            level = max(level, sev(dtemp, 70, 80))
-        lines.append(kv("Drive", row, w))
-    return (lines or [txt("no disks found", "faint")]), level
+    if len(d["mounts"]) > 3:
+        lines.append(txt(f"+{len(d['mounts']) - 3} more", "faint"))
+    if not d["mounts"]:
+        lines.append(kv("Mount", "not mounted", w, "faint"))
+    io = c.disk_io.get(d["name"])
+    if io:
+        lines.append(rate_row("R", io["rh"], io["r"], "teal", w))
+        lines.append(rate_row("W", io["wh"], io["w"], "mauve", w))
+    parts = (f"{d['nparts']} partition{'s' if d['nparts'] != 1 else ''}") if d["nparts"] else "whole disk"
+    lines.append(kv("Parts", f"{parts}  ·  {len(d['mounts'])} mounted", w))
+    row = txt(d["kind"])
+    if d["mounts"]:
+        row.append(f" · {d['mounts'][0].fstype}")
+    if d["usb"]:
+        row.append(" · USB", style=T["muted"])
+    dt = drive_temp(d["name"])
+    if dt is not None:
+        row.append(f"  {dt:.0f}°C", style=scolor(dt, 70, 80))
+        level = max(level, sev(dt, 70, 80))
+    lines.append(kv("Drive", row, w))
+    # A nearly full drive you aren't looking at should still light up the border.
+    for o in c.disks:
+        if o is d:
+            continue
+        for p in o["mounts"]:
+            try:
+                if sev(psutil.disk_usage(p.mountpoint).percent, 85, 95):
+                    level = max(level, 1)
+                    if "!" not in suffix:
+                        suffix += "  ! other drive"
+            except OSError:
+                pass
+    return lines, level, suffix
 
 
 def signal_text(n):
@@ -1116,6 +1447,20 @@ def tile_network(c, w):
         if a.family == socket.AF_INET:
             ip = a.address
     lines.append(kv("Local IP", ip, w))
+    dns = c.get("dns")
+    if dns not in (None, LOADING) and dns:
+        t = txt("  ".join(dns[:2]))
+        if len(dns) > 2:
+            t.append(f"  +{len(dns) - 2}", style=T["faint"])
+        lines.append(kv("DNS", t, w))
+    vpn = c.get("vpn")
+    if vpn not in (None, LOADING):
+        if vpn["active"]:
+            t = txt("on", "ok", bold=True)
+            t.append("  " + ", ".join(vpn["names"]), style=T["muted"])
+            lines.append(kv("VPN", t, w))
+        else:
+            lines.append(kv("VPN", "off", w, "faint"))
     lines.append(rate_row("↓", c.down_hist, c.down, "blue", w))
     lines.append(rate_row("↑", c.up_hist, c.up, "peach", w))
     if c.net_total:
@@ -1123,6 +1468,14 @@ def tile_network(c, w):
     vendor = c.get("nic")
     if vendor not in (None, LOADING):
         lines.append(kv("Vendor", vendor, w))
+    if wifi:
+        mon = c.get("monmode")
+        if mon is True:
+            lines.append(kv("Monitor", "supported", w))
+        elif mon is False:
+            lines.append(kv("Monitor", "not supported", w, "faint"))
+        elif mon is None and not shutil.which("iw"):
+            lines.append(kv("Monitor", "install iw to check", w, "faint"))
     return lines, 0
 
 
@@ -1227,6 +1580,16 @@ def tile_display(c, w):
     lines = [split(txt(res, bold=True), txt(f"{m['rate']:.0f} Hz" if m["rate"] else "", "muted"), w)]
     panel = " ".join(x for x in (m["vendor"], m["model"]) if x)
     lines.append(kv("Panel", panel or m["name"], w))
+    sc = m.get("scale")
+    if sc:
+        t = txt(f"{sc * 100:.0f}%")
+        mm = re.match(r"(\d+)x(\d+)", m["mode"] or "")
+        if mm and abs(sc - 1) > 0.01:
+            t.append(f"  → {round(int(mm.group(1)) / sc)}×{round(int(mm.group(2)) / sc)}", style=T["faint"])
+        lines.append(kv("Scale", t, w))
+    bright = brightness()
+    if bright is not None:
+        lines.append(bar_row("Bright", bright, txt(f"{bright:>3.0f}%"), w, color=T["blue"]))
     lines.append(kv("Screens", str(len(mons)), w))
     lines.append(kv("Session", (os.environ.get("XDG_SESSION_TYPE") or "–").capitalize(), w))
     for extra in mons[1:3]:
@@ -1235,7 +1598,7 @@ def tile_display(c, w):
 
 
 def tile_battery(c, w):
-    b = battery_info()
+    b = c.battery
     if not b:
         return None
     pct, status = b["pct"], b["status"]
@@ -1245,9 +1608,13 @@ def tile_battery(c, w):
     symbol = {"Charging": "▲ Charging", "Discharging": "▼ Discharging", "Full": "● Full",
               "Not charging": "– Not charging"}.get(status, status)
     lines = [head, kv("Status", txt(symbol, "ok" if status == "Charging" else "bright"), w)]
-    if b["left"]:
-        h, m = divmod(int(b["left"]) // 60, 60)
-        lines.append(kv("Left", f"{h}h {m:02d}m", w))
+    if status in ("Charging", "Discharging"):
+        label = "To full" if status == "Charging" else "Left"
+        if c.batt_eta:
+            h, m = divmod(int(c.batt_eta) // 60, 60)
+            lines.append(kv(label, f"{h}h {m:02d}m", w))
+        else:
+            lines.append(kv(label, "–", w, "faint"))
     if b["watts"]:
         lines.append(kv("Power", f"{b['watts']:.1f} W", w))
     if b["health"]:
@@ -1289,25 +1656,32 @@ def header():
     return t
 
 
-def footer(interval, theme):
+def footer(interval, theme, show_drive_keys):
     t = bar_table()
     hint = Text.assemble(("Ctrl+C", f"bold {T['peach']}"), (" quit", T["muted"]))
+    if show_drive_keys:
+        hint.append("   ")
+        hint.append("[ ]", style=f"bold {T['peach']}")
+        hint.append(" drive", style=T["muted"])
     t.add_row(hint, Text(""), txt(f"every {interval:g}s · {theme}", "faint"))
     return t
 
 
 def make_panel(tile, width, height, limit):
-    name, lines, level = tile
+    name, lines, level, suffix = tile
     lines = lines[:limit] if limit else lines
     for ln in lines:
         ln.no_wrap = True
         ln.overflow = "ellipsis"
     border = (T["border"], T["warn"], T["crit"])[level]
-    return Panel(Group(*lines), title=Text(name, style=f"bold {T['title']}"), title_align="left",
+    title = Text(name, style=f"bold {T['title']}")
+    if suffix:
+        title.append("  " + suffix, style=T["muted"])
+    return Panel(Group(*lines), title=title, title_align="left",
                  border_style=border, box=box.ROUNDED, padding=(0, 1), width=width, height=height)
 
 
-def render(c, console, interval, theme, fill):
+def render(c, console, interval, theme, fill, interactive=False):
     width, height = console.size
     cols = 4 if width >= 128 else 3 if width >= 96 else 2 if width >= 64 else 1
     base, extra = divmod(width - (cols - 1), cols)
@@ -1320,7 +1694,7 @@ def render(c, console, interval, theme, fill):
         except Exception:
             res = ([txt("unavailable", "faint")], 0)
         if res is not None:
-            tiles.append((name, res[0], res[1]))
+            tiles.append((name, res[0], res[1], res[2] if len(res) > 2 else ""))
     rows = [tiles[i:i + cols] for i in range(0, len(tiles), cols)]
     avail = height - 2
     limit = None
@@ -1345,7 +1719,7 @@ def render(c, console, interval, theme, fill):
                 cells.append("")
             cells.append(make_panel(r[i], widths[i], h, limit) if i < len(r) else "")
         grid.add_row(*cells)
-    return Group(header(), grid, footer(interval, theme))
+    return Group(header(), grid, footer(interval, theme, interactive and len(c.disks) > 1))
 
 
 # --------------------------------------------------------------------------- #
@@ -1356,6 +1730,8 @@ def main():
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="refresh seconds (default 2)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
     ap.add_argument("--theme", choices=list(THEMES), default="mocha")
+    ap.add_argument("--disk", metavar="NAME",
+                    help="start the Storage tile on this drive, e.g. nvme0n1 (switch live with [ and ])")
     ap.add_argument("--public-ip", action="store_true",
                     help="look up public IP via api.ipify.org (off by default)")
     args = ap.parse_args()
@@ -1365,8 +1741,10 @@ def main():
 
     console = Console()
     c = Collector(public_ip=args.public_ip)
+    c.disk_sel = args.disk
 
     if args.once or not sys.stdout.isatty():
+        c.sample()
         time.sleep(0.5)
         c.sample()
         time.sleep(0.5)
@@ -1375,14 +1753,28 @@ def main():
         console.print(render(c, console, args.interval, args.theme, fill=False))
         return 0
 
+    c.sample()              # first sample sets the active interface and drives the slow jobs use
     c.start_background()
-    time.sleep(0.3)
+    time.sleep(0.4)
     try:
-        with Live(console=console, screen=True, auto_refresh=False, vertical_overflow="crop") as live:
+        with Keys() as keys, Live(console=console, screen=True, auto_refresh=False,
+                                  vertical_overflow="crop") as live:
+            def draw():
+                live.update(render(c, console, args.interval, args.theme, True, keys.active), refresh=True)
+
             while True:
                 c.sample()
-                live.update(render(c, console, args.interval, args.theme, fill=True), refresh=True)
-                time.sleep(args.interval)
+                draw()
+                deadline = time.monotonic() + args.interval
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    for k in keys.wait(left):
+                        if k == "quit":
+                            return 0
+                        c.cycle_disk(1 if k == "next" else -1)
+                        draw()
     except KeyboardInterrupt:
         pass
     return 0
