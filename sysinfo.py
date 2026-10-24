@@ -6,9 +6,18 @@
     sysinfo.py -i 1 --theme tokyo
     sysinfo.py --public-ip      also look up your public IP (off by default)
     sysinfo.py --disk sda       start the Storage tile on a specific drive
+    sysinfo.py --no-mouse       don't capture the mouse (keeps normal text selection)
 
-Keys (live mode):  [ and ]  (or Tab / arrow keys)  switch drive in the Storage tile,
-                   q or Ctrl+C quits.
+Live mode controls:
+    mouse wheel      scroll the tile under the pointer (Processes, Peripherals;
+                     on Storage it switches drive)
+    click            focus a tile (blue border); click the Processes column header
+                     row to toggle CPU / memory sorting
+    j / k, Up / Down, PgUp / PgDn   scroll the focused tile (Processes by default)
+    s                toggle process sort (CPU <-> memory)
+    [ and ]  (or Tab / Left / Right)   switch drive in the Storage tile
+    q or Ctrl+C      quit
+With mouse capture on, hold Shift to select text in most terminals.
 
 Dependencies (Debian):  sudo apt install python3-rich python3-psutil
 Optional tools that unlock more info: iw (Wi-Fi monitor-mode support), resolvectl,
@@ -56,6 +65,15 @@ TOOL_NAME = "sysinfo"
 LABEL_W = 9
 LOADING = object()
 
+# Tools like iw, lspci or resolvectl often live in /usr/sbin, which a normal user's PATH
+# may not include. Search there too so the dashboard works however it was launched.
+SEARCH_PATH = os.environ.get("PATH", "") + os.pathsep + "/usr/sbin:/sbin:/usr/local/sbin"
+
+
+def which(cmd):
+    return shutil.which(cmd, path=SEARCH_PATH)
+
+
 # --------------------------------------------------------------------------- #
 # Themes. Every colour is assigned by role, so a theme is just a dict.
 # --------------------------------------------------------------------------- #
@@ -75,6 +93,9 @@ THEMES = {
 }
 T: dict = dict(THEMES["mocha"])
 
+# Tiles whose content scrolls. Value = default line budget before the first layout pass.
+FLEX = {"Processes": 7, "Peripherals": 5}
+
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -88,11 +109,12 @@ def read(path, default=None):
 
 
 def run(cmd, timeout=1.5):
-    if not shutil.which(cmd[0]):
+    exe = which(cmd[0])
+    if not exe:
         return None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env={**os.environ, "LC_ALL": "C"})
+        r = subprocess.run([exe] + list(cmd[1:]), capture_output=True, text=True,
+                           timeout=timeout, env={**os.environ, "LC_ALL": "C"})
     except (subprocess.SubprocessError, OSError):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -100,11 +122,12 @@ def run(cmd, timeout=1.5):
 
 def run_rc(cmd, timeout=1.5):
     """Like run(), but returns (exit_code, stdout) so callers can accept non-zero codes."""
-    if not shutil.which(cmd[0]):
+    exe = which(cmd[0])
+    if not exe:
         return None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env={**os.environ, "LC_ALL": "C"})
+        r = subprocess.run([exe] + list(cmd[1:]), capture_output=True, text=True,
+                           timeout=timeout, env={**os.environ, "LC_ALL": "C"})
     except (subprocess.SubprocessError, OSError):
         return None
     return r.returncode, r.stdout
@@ -349,7 +372,7 @@ def lspci_names(slot):
 
 
 def gpu_info():
-    if shutil.which("nvidia-smi"):
+    if which("nvidia-smi"):
         out = run(["nvidia-smi", "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,"
                    "memory.total,clocks.gr", "--format=csv,noheader,nounits"], timeout=2)
         if out:
@@ -661,7 +684,7 @@ def bluetooth_devices():
 
 
 def audio_info():
-    if shutil.which("pactl"):
+    if which("pactl"):
         sink = (run(["pactl", "get-default-sink"]) or "").strip()
         source = (run(["pactl", "get-default-source"]) or "").strip()
         if sink:
@@ -682,8 +705,8 @@ def audio_info():
     if out:
         m = re.search(r"([\d.]+)", out)
 
-        def node(which):
-            info = run(["wpctl", "inspect", which]) or ""
+        def node(which_node):
+            info = run(["wpctl", "inspect", which_node]) or ""
             d = re.search(r'node\.description = "(.*)"', info)
             return d.group(1) if d else None
 
@@ -883,12 +906,12 @@ def fan_speeds():
 def pending_updates():
     """Number of upgradable packages according to the local package lists (no network,
     no root). Returns None if the package manager isn't supported or the check fails."""
-    if shutil.which("apt-get"):
+    if which("apt-get"):
         res = run_rc(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=30)
         if res and res[0] == 0:
             return sum(1 for ln in res[1].splitlines() if ln.startswith("Inst "))
         return None
-    if shutil.which("pacman"):
+    if which("pacman"):
         res = run_rc(["pacman", "-Qu"], timeout=15)
         if res is None:
             return None
@@ -896,7 +919,7 @@ def pending_updates():
         if rc == 0:
             return len([ln for ln in out.splitlines() if ln.strip()])
         return 0 if rc == 1 and not out.strip() else None
-    if shutil.which("dnf"):
+    if which("dnf"):
         res = run_rc(["dnf", "check-update", "--cacheonly", "-q"], timeout=30)
         if res is None:
             return None
@@ -914,7 +937,7 @@ def pending_updates():
     return None
 
 
-UPDATES_SUPPORTED = any(shutil.which(x) for x in ("apt-get", "pacman", "dnf"))
+UPDATES_SUPPORTED = any(which(x) for x in ("apt-get", "pacman", "dnf"))
 
 
 def failed_units():
@@ -952,25 +975,47 @@ def reboot_required():
 
 
 # --------------------------------------------------------------------------- #
-# Keyboard input (live mode only)
+# Keyboard + mouse input (live mode only)
 # --------------------------------------------------------------------------- #
-_KEY_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|.", re.S)
-_KEYMAP = {"]": "next", ".": "next", "\t": "next", "\x1b[C": "next", "\x1bOC": "next",
-           "[": "prev", ",": "prev", "\x1b[Z": "prev", "\x1b[D": "prev", "\x1bOD": "prev",
-           "q": "quit", "Q": "quit"}
+# Events are (kind, value, x, y) tuples. kinds: next prev quit sort line scroll click
+_MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+_KEY_RE = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|.", re.S)
+_KEYMAP = {"]": ("next", 0), ".": ("next", 0), "\t": ("next", 0),
+           "\x1b[C": ("next", 0), "\x1bOC": ("next", 0),
+           "[": ("prev", 0), ",": ("prev", 0), "\x1b[Z": ("prev", 0),
+           "\x1b[D": ("prev", 0), "\x1bOD": ("prev", 0),
+           "q": ("quit", 0), "Q": ("quit", 0),
+           "s": ("sort", 0), "S": ("sort", 0),
+           "j": ("line", 1), "\x1b[B": ("line", 1), "\x1bOB": ("line", 1),
+           "k": ("line", -1), "\x1b[A": ("line", -1), "\x1bOA": ("line", -1),
+           "\x1b[6~": ("line", 5), "\x1b[5~": ("line", -5)}
 
 
 def parse_keys(data):
-    return [_KEYMAP[t] for t in _KEY_RE.findall(data) if t in _KEYMAP]
+    out = []
+    for t in _KEY_RE.findall(data):
+        m = _MOUSE_RE.fullmatch(t)
+        if m:
+            b, x, y = int(m[1]), int(m[2]) - 1, int(m[3]) - 1
+            if b & 64:                                   # wheel: 64 = up, 65 = down
+                out.append(("scroll", 1 if b & 1 else -1, x, y))
+            elif (b & 3) == 0 and not (b & 32) and m[4] == "M":   # left button press
+                out.append(("click", 0, x, y))
+        elif t in _KEYMAP:
+            kind, val = _KEYMAP[t]
+            out.append((kind, val, 0, 0))
+    return out
 
 
 class Keys:
-    """Non-blocking key reader. Uses cbreak mode, so Ctrl+C still raises KeyboardInterrupt,
-    and always restores the terminal on exit."""
+    """Non-blocking key/mouse reader. Uses cbreak mode, so Ctrl+C still raises KeyboardInterrupt,
+    and always restores the terminal (including mouse reporting) on exit."""
 
-    def __init__(self):
+    def __init__(self, mouse=True):
         self.fd = None
         self._old = None
+        self.want_mouse = mouse
+        self.mouse = False
 
     @property
     def active(self):
@@ -984,6 +1029,10 @@ class Keys:
                 self.fd = sys.stdin.fileno()
                 self._old = termios.tcgetattr(self.fd)
                 tty.setcbreak(self.fd)
+                if self.want_mouse:
+                    sys.stdout.write("\x1b[?1000h\x1b[?1006h")   # button events + SGR encoding
+                    sys.stdout.flush()
+                    self.mouse = True
         except Exception:
             self.fd = None
         return self
@@ -991,17 +1040,20 @@ class Keys:
     def __exit__(self, *exc):
         if self.fd is not None:
             import termios
+            if self.mouse:
+                sys.stdout.write("\x1b[?1006l\x1b[?1000l")
+                sys.stdout.flush()
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old)
 
     def wait(self, timeout):
-        """Wait up to `timeout` seconds; return a list of 'next' / 'prev' / 'quit' events."""
+        """Wait up to `timeout` seconds; return a list of (kind, value, x, y) events."""
         if self.fd is None:
             time.sleep(max(timeout, 0))
             return []
         ready, _, _ = select.select([self.fd], [], [], max(timeout, 0))
         if not ready:
             return []
-        return parse_keys(os.read(self.fd, 64).decode("utf-8", "ignore"))
+        return parse_keys(os.read(self.fd, 512).decode("utf-8", "ignore"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1026,8 +1078,16 @@ class Collector:
         self.batt_eta = None
         self.rate_hist = deque(maxlen=20)
         self._batt_status = None
+        self._procs = []
         self.top = []
         self.ntasks = 0
+        self.sort = "cpu"
+        # interaction state
+        self.focus = None
+        self.proc_off = 0
+        self.periph_off = 0
+        self.hitboxes = []
+        self.flex = dict(FLEX)
         self.cpu_name = cpu_model()
         self.ncpu = psutil.cpu_count() or 1
         self._slow = {}
@@ -1043,7 +1103,7 @@ class Collector:
             "monmode": (lambda: wifi_monitor_support(self.iface), 60),
             "sensors": (self._sensors, 2), "reboot": (reboot_required, 30),
         }
-        if shutil.which("systemctl"):
+        if which("systemctl"):
             self.slow_jobs["services"] = (failed_units, 30)
         if UPDATES_SUPPORTED:
             self.slow_jobs["updates"] = (pending_updates, 1800)
@@ -1064,6 +1124,45 @@ class Collector:
             return
         names = [d["name"] for d in self.disks]
         self.disk_sel = names[(names.index(cur["name"]) + step) % len(names)]
+
+    # -- interaction --
+    def tile_at(self, x, y):
+        for box in self.hitboxes:
+            _, x0, y0, x1, y1 = box
+            if x0 <= x < x1 and y0 <= y < y1:
+                return box
+        return None
+
+    def toggle_sort(self):
+        self.sort = "mem" if self.sort == "cpu" else "cpu"
+        self.proc_off = 0
+        self._sort_top()
+
+    def scroll(self, name, step):
+        if name == "Processes":
+            self.proc_off += step
+        elif name == "Peripherals":
+            self.periph_off += step
+        elif name == "Storage":
+            self.cycle_disk(1 if step > 0 else -1)
+
+    def handle(self, kind, val, x=0, y=0):
+        if kind in ("next", "prev"):
+            self.cycle_disk(1 if kind == "next" else -1)
+        elif kind == "sort":
+            self.toggle_sort()
+        elif kind == "click":
+            box = self.tile_at(x, y)
+            self.focus = box[0] if box else None
+            # Row y0+2 of the Processes tile is its column-header line.
+            if box and box[0] == "Processes" and y == box[2] + 2:
+                self.toggle_sort()
+        elif kind == "scroll":
+            box = self.tile_at(x, y)
+            if box:
+                self.scroll(box[0], val)
+        elif kind == "line":
+            self.scroll(self.focus or "Processes", val)
 
     # -- slow data --
     def get(self, key):
@@ -1093,6 +1192,13 @@ class Collector:
                 time.sleep(ttl)
         for key, (fn, ttl) in self.slow_jobs.items():
             threading.Thread(target=loop, args=(key, fn, ttl), daemon=True).start()
+
+    def _sort_top(self):
+        if self.sort == "mem":
+            key = lambda x: (x[3], x[0])
+        else:
+            key = lambda x: (x[0], x[3])
+        self.top = sorted(self._procs, key=key, reverse=True)[:60]
 
     # -- fast data, sampled every refresh --
     def sample(self):
@@ -1174,8 +1280,8 @@ class Collector:
             procs.append(((i.get("cpu_percent") or 0.0) / self.ncpu, i["pid"],
                           i.get("name") or "?", mi.rss if mi else 0))
         self.ntasks = len(procs)
-        procs.sort(key=lambda x: (x[0], x[3]), reverse=True)
-        self.top = procs[:8]
+        self._procs = procs
+        self._sort_top()
 
 
 # --------------------------------------------------------------------------- #
@@ -1195,6 +1301,10 @@ def tile_machine(c, w):
         a, b = product.split("_", 1)
         if a == b:
             product = a
+    if product and "ASUSLaptop" in product:
+        # "Vivobook_ASUSLaptop K5504VA_S5504VA" -> "Vivobook K5504VA S5504VA"
+        product = re.sub(r"_?ASUSLaptop\s*", " ", product).replace("_", " ")
+        product = re.sub(r"\s+", " ", product).strip()
     vendor_raw = read(d + "sys_vendor") or read(d + "board_vendor")
     bios, date = read(d + "bios_version"), read(d + "bios_date")
     if date and re.match(r"\d\d/\d\d/\d{4}$", date):
@@ -1324,7 +1434,8 @@ def tile_ram(c, w):
     sw = psutil.swap_memory()
     if sw.total:
         lines.append(bar_row("Swap", sw.percent, txt(f"{human_size(sw.used)}/{human_size(sw.total)}"),
-                             w, color=T["peach"] if sw.percent < 90 else T["crit"]))
+                             w, color=T["crit"] if sw.percent >= 90 else T["warn"] if sw.percent >= 70
+                             else T["peach"]))
     else:
         lines.append(kv("Swap", "none", w, "faint"))
     level = sev(pct, 80, 92)
@@ -1377,8 +1488,8 @@ def tile_storage(c, w):
     if io:
         lines.append(rate_row("R", io["rh"], io["r"], "teal", w))
         lines.append(rate_row("W", io["wh"], io["w"], "mauve", w))
-    parts = (f"{d['nparts']} partition{'s' if d['nparts'] != 1 else ''}") if d["nparts"] else "whole disk"
-    lines.append(kv("Parts", f"{parts}  ·  {len(d['mounts'])} mounted", w))
+    parts = f"{d['nparts']} parts" if d["nparts"] else "whole disk"
+    lines.append(kv("Parts", f"{parts} · {len(d['mounts'])} mounted", w))
     row = txt(d["kind"])
     if d["mounts"]:
         row.append(f" · {d['mounts'][0].fstype}")
@@ -1474,7 +1585,7 @@ def tile_network(c, w):
             lines.append(kv("Monitor", "supported", w))
         elif mon is False:
             lines.append(kv("Monitor", "not supported", w, "faint"))
-        elif mon is None and not shutil.which("iw"):
+        elif mon is None and not which("iw"):
             lines.append(kv("Monitor", "install iw to check", w, "faint"))
     return lines, 0
 
@@ -1521,18 +1632,31 @@ def tile_os(c, w):
 
 
 def tile_processes(c, w):
+    """Scrollable process list. Visible rows grow with the tile; scroll with the wheel or j/k,
+    click the header row (or press s) to switch between CPU and memory sorting."""
     la = os.getloadavg()
     lines = [split(txt(f"Load {la[0]:.2f} {la[1]:.2f} {la[2]:.2f}", bold=True),
                    txt(f"{c.ntasks} tasks", "muted"), w)]
     nw = max(w - 21, 6)
-    lines.append(txt(f"{'Name':<{nw}} {'PID':>7} {'CPU%':>5} {'MEM':>6}", "muted"))
-    for cpu, pid, name, rss in c.top[:5]:
+    on = f"bold {T['title']}"
+    head = Text(f"{'Name':<{nw}} {'PID':>7} ", style=T["muted"])
+    head.append(f"{'CPU%':>5}", style=on if c.sort == "cpu" else T["muted"])
+    head.append(" ", style=T["muted"])
+    head.append(f"{'MEM':>6}", style=on if c.sort == "mem" else T["muted"])
+    lines.append(head)
+    rows = max(1, min(c.flex.get("Processes", FLEX["Processes"]) - 2, 30))
+    n = len(c.top)
+    c.proc_off = max(0, min(c.proc_off, max(n - rows, 0)))
+    for cpu, pid, name, rss in c.top[c.proc_off:c.proc_off + rows]:
         row = Text(f"{name[:nw]:<{nw}} ", style=T["bright"])
         row.append(f"{pid:>7} ", style=T["muted"])
         row.append(f"{cpu:>5.1f}", style=scolor(cpu, 50, 80))
         row.append(f" {human_size(rss):>6}", style=T["bright"])
         lines.append(row)
-    return lines, 0
+    suffix = f"by {c.sort}"
+    if n > rows:
+        suffix += f"  {c.proc_off + 1}-{min(c.proc_off + rows, n)}/{n}"
+    return lines, 0, suffix
 
 
 def tile_peripherals(c, w):
@@ -1547,10 +1671,13 @@ def tile_peripherals(c, w):
         items.append((name, tag))
     if not items:
         return [txt("none detected", "faint")], 0
-    lines = [split(txt(n), tag, w) for n, tag in items[:5]]
-    if len(items) > 5:
-        lines.append(txt(f"+{len(items) - 5} more", "faint"))
-    return lines, 0
+    rows = max(1, c.flex.get("Peripherals", FLEX["Peripherals"]))
+    n = len(items)
+    c.periph_off = max(0, min(c.periph_off, max(n - rows, 0)))
+    shown = items[c.periph_off:c.periph_off + rows]
+    lines = [split(txt(nm), tag, w) for nm, tag in shown]
+    suffix = f"{c.periph_off + 1}-{min(c.periph_off + rows, n)}/{n}" if n > rows else ""
+    return lines, 0, suffix
 
 
 def tile_audio(c, w):
@@ -1656,24 +1783,35 @@ def header():
     return t
 
 
-def footer(interval, theme, show_drive_keys):
-    t = bar_table()
-    hint = Text.assemble(("Ctrl+C", f"bold {T['peach']}"), (" quit", T["muted"]))
-    if show_drive_keys:
-        hint.append("   ")
-        hint.append("[ ]", style=f"bold {T['peach']}")
-        hint.append(" drive", style=T["muted"])
-    t.add_row(hint, Text(""), txt(f"every {interval:g}s · {theme}", "faint"))
+def footer(interval, theme, interactive, multi_disk, mouse):
+    t = Table(show_header=False, show_edge=False, box=None, expand=True,
+              padding=(0, 1), style=f"on {T['bar']}")
+    t.add_column(ratio=4, justify="left", no_wrap=True, overflow="ellipsis")
+    t.add_column(ratio=1, justify="right", no_wrap=True)
+    key = f"bold {T['peach']}"
+    hint = Text.assemble(("Ctrl+C", key), (" quit", T["muted"]))
+    if interactive:
+        hint.append("   s", style=key)
+        hint.append(" sort", style=T["muted"])
+        hint.append("   wheel" if mouse else "   j/k", style=key)
+        hint.append(" scroll", style=T["muted"])
+        if mouse:
+            hint.append("   click", style=key)
+            hint.append(" focus", style=T["muted"])
+        if multi_disk:
+            hint.append("   [ ]", style=key)
+            hint.append(" drive", style=T["muted"])
+    t.add_row(hint, txt(f"every {interval:g}s · {theme}", "faint"))
     return t
 
 
-def make_panel(tile, width, height, limit):
+def make_panel(tile, width, height, limit, focused=False):
     name, lines, level, suffix = tile
     lines = lines[:limit] if limit else lines
     for ln in lines:
         ln.no_wrap = True
         ln.overflow = "ellipsis"
-    border = (T["border"], T["warn"], T["crit"])[level]
+    border = T["blue"] if focused else (T["border"], T["warn"], T["crit"])[level]
     title = Text(name, style=f"bold {T['title']}")
     if suffix:
         title.append("  " + suffix, style=T["muted"])
@@ -1681,7 +1819,14 @@ def make_panel(tile, width, height, limit):
                  border_style=border, box=box.ROUNDED, padding=(0, 1), width=width, height=height)
 
 
-def render(c, console, interval, theme, fill, interactive=False):
+def tile_len(t):
+    """Natural height of a tile's content. Scrollable tiles are capped so that showing more rows
+    when space is available never makes the row itself grow."""
+    n = len(t[1])
+    return min(n, FLEX[t[0]]) if t[0] in FLEX else n
+
+
+def render(c, console, interval, theme, fill, interactive=False, mouse=False):
     width, height = console.size
     cols = 4 if width >= 128 else 3 if width >= 96 else 2 if width >= 64 else 1
     base, extra = divmod(width - (cols - 1), cols)
@@ -1700,13 +1845,26 @@ def render(c, console, interval, theme, fill, interactive=False):
     limit = None
     for lim in (None, 8, 6, 5, 4, 3):
         limit = lim
-        need = sum(min(max(len(t[1]) for t in r), lim or 99) + 2 for r in rows)
+        need = sum(min(max(tile_len(t) for t in r), lim or 99) + 2 for r in rows)
         if need <= avail:
             break
-    heights = [min(max(len(t[1]) for t in r), limit or 99) + 2 for r in rows]
+    heights = [min(max(tile_len(t) for t in r), limit or 99) + 2 for r in rows]
     if fill:
         spare = min(max(avail - sum(heights), 0) // len(rows), 3)
         heights = [h + spare for h in heights]
+
+    # Remember where every tile sits (for mouse hit-testing) and how many lines the
+    # scrollable tiles may use on the next frame.
+    c.hitboxes = []
+    y = 1                                   # row 0 is the header bar
+    for r, h in zip(rows, heights):
+        for i, t in enumerate(r):
+            x0 = sum(widths[:i]) + i
+            c.hitboxes.append((t[0], x0, y, x0 + widths[i], y + h))
+            if t[0] in FLEX:
+                c.flex[t[0]] = h - 2
+        y += h
+
     grid = Table.grid(padding=0)
     for i, wd in enumerate(widths):
         if i:
@@ -1717,9 +1875,11 @@ def render(c, console, interval, theme, fill, interactive=False):
         for i in range(cols):
             if i:
                 cells.append("")
-            cells.append(make_panel(r[i], widths[i], h, limit) if i < len(r) else "")
+            cells.append(make_panel(r[i], widths[i], h, limit, interactive and c.focus == r[i][0])
+                         if i < len(r) else "")
         grid.add_row(*cells)
-    return Group(header(), grid, footer(interval, theme, interactive and len(c.disks) > 1))
+    return Group(header(), grid,
+                 footer(interval, theme, interactive, interactive and len(c.disks) > 1, mouse))
 
 
 # --------------------------------------------------------------------------- #
@@ -1734,6 +1894,8 @@ def main():
                     help="start the Storage tile on this drive, e.g. nvme0n1 (switch live with [ and ])")
     ap.add_argument("--public-ip", action="store_true",
                     help="look up public IP via api.ipify.org (off by default)")
+    ap.add_argument("--no-mouse", action="store_true",
+                    help="don't capture the mouse (normal text selection; scroll with j/k)")
     args = ap.parse_args()
     args.interval = max(args.interval, 0.5)
     T.clear()
@@ -1757,10 +1919,12 @@ def main():
     c.start_background()
     time.sleep(0.4)
     try:
-        with Keys() as keys, Live(console=console, screen=True, auto_refresh=False,
-                                  vertical_overflow="crop") as live:
+        with Keys(mouse=not args.no_mouse) as keys, \
+                Live(console=console, screen=True, auto_refresh=False,
+                     vertical_overflow="crop") as live:
             def draw():
-                live.update(render(c, console, args.interval, args.theme, True, keys.active), refresh=True)
+                live.update(render(c, console, args.interval, args.theme, True,
+                                   keys.active, keys.mouse), refresh=True)
 
             while True:
                 c.sample()
@@ -1770,10 +1934,10 @@ def main():
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break
-                    for k in keys.wait(left):
-                        if k == "quit":
+                    for kind, val, x, y in keys.wait(left):
+                        if kind == "quit":
                             return 0
-                        c.cycle_disk(1 if k == "next" else -1)
+                        c.handle(kind, val, x, y)
                         draw()
     except KeyboardInterrupt:
         pass
