@@ -89,6 +89,18 @@ def run(cmd, timeout=1.5):
     return r.stdout if r.returncode == 0 else None
 
 
+def run_rc(cmd, timeout=1.5):
+    """Like run(), but returns (exit_code, stdout) so callers can accept non-zero codes."""
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "LC_ALL": "C"})
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return r.returncode, r.stdout
+
+
 def fnum(s):
     try:
         return float(s)
@@ -429,7 +441,8 @@ def root_drive():
         kind = "HDD" if read(base + "/queue/rotational") == "1" else "SSD"
     return dict(model=re.sub(r"\s+", " ", model) if model else None,
                 size=human_size(sectors * 512).replace("B", "") + "B" if sectors else None,
-                kind=kind if os.path.exists(base) else None, fstype=fstype)
+                kind=kind if os.path.exists(base) else None, fstype=fstype,
+                dev=name if os.path.exists(base) else None)
 
 
 def list_mounts():
@@ -620,8 +633,139 @@ def battery_info():
                 cycles=fnum(read(b + "/cycle_count")))
 
 
+def read_pressure(kind="memory"):
+    """Pressure-stall info from /proc/pressure/<kind> (avg10, in %): {'some': x, 'full': y}.
+    None when the kernel has PSI disabled or doesn't provide it."""
+    text = read(f"/proc/pressure/{kind}")
+    if not text:
+        return None
+    res = {}
+    for line in text.splitlines():
+        parts = line.split()
+        for p in parts[1:]:
+            if p.startswith("avg10="):
+                v = fnum(p[6:])
+                if v is not None:
+                    res[parts[0]] = v
+    return res or None
+
+
+def disk_io_totals():
+    """(read_bytes, write_bytes) summed over physical disks only, so partitions,
+    loop devices and dm/LVM layers aren't counted twice. None if unavailable."""
+    try:
+        per = psutil.disk_io_counters(perdisk=True)
+    except Exception:
+        return None
+    r = w = 0
+    found = False
+    for name, st in (per or {}).items():
+        if os.path.exists(f"/sys/block/{name}/device"):
+            r += st.read_bytes
+            w += st.write_bytes
+            found = True
+    return (r, w) if found else None
+
+
+def fan_speeds():
+    fn = getattr(psutil, "sensors_fans", None)
+    try:
+        data = fn() if fn else {}
+    except Exception:
+        return []
+    return [e.current for entries in (data or {}).values() for e in entries]
+
+
+def drive_temp(dev):
+    """Temperature of a block device (NVMe, or SATA with the drivetemp module), in °C."""
+    if not dev:
+        return None
+    for pat in (f"/sys/block/{dev}/device/hwmon*/temp1_input",
+                f"/sys/block/{dev}/device/hwmon/hwmon*/temp1_input"):
+        for t in glob.glob(pat):
+            v = fnum(read(t))
+            if v is not None:
+                return v / 1000
+    return None
+
+
+def sensor_data(dev):
+    return dict(fans=fan_speeds(), drive_temp=drive_temp(dev))
+
+
+def pending_updates():
+    """Number of upgradable packages according to the local package lists (no network,
+    no root). Returns None if the package manager isn't supported or the check fails."""
+    if shutil.which("apt-get"):
+        res = run_rc(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=30)
+        if res and res[0] == 0:
+            return sum(1 for ln in res[1].splitlines() if ln.startswith("Inst "))
+        return None
+    if shutil.which("pacman"):
+        res = run_rc(["pacman", "-Qu"], timeout=15)
+        if res is None:
+            return None
+        rc, out = res
+        if rc == 0:
+            return len([ln for ln in out.splitlines() if ln.strip()])
+        return 0 if rc == 1 and not out.strip() else None
+    if shutil.which("dnf"):
+        res = run_rc(["dnf", "check-update", "--cacheonly", "-q"], timeout=30)
+        if res is None:
+            return None
+        rc, out = res
+        if rc == 0:
+            return 0
+        if rc == 100:
+            n = 0
+            for ln in out.splitlines():
+                if ln.startswith("Obsoleting"):
+                    break
+                if re.match(r"^\S+\.\S+\s+\S+\s+\S+\s*$", ln):
+                    n += 1
+            return n
+    return None
+
+
+UPDATES_SUPPORTED = any(shutil.which(x) for x in ("apt-get", "pacman", "dnf"))
+
+
+def failed_units():
+    """Names of failed systemd units (system + user). None if systemd isn't usable here."""
+    names, got = [], False
+    for cmd in (["systemctl", "--failed", "--no-legend", "--plain", "--no-pager"],
+                ["systemctl", "--user", "--failed", "--no-legend", "--plain", "--no-pager"]):
+        out = run(cmd, timeout=3)
+        if out is None:
+            continue
+        got = True
+        for ln in out.splitlines():
+            f = ln.split()
+            if f:
+                names.append(f[0])
+    return names if got else None
+
+
+def reboot_required():
+    if os.path.exists("/run/reboot-required") or os.path.exists("/var/run/reboot-required"):
+        return True
+    rel = platform.release()
+    if "microsoft" in rel.lower() or os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return False
+    # If the running kernel's modules are gone, the kernel was replaced since boot (Arch, Fedora...).
+    for base in ("/usr/lib/modules", "/lib/modules"):
+        if os.path.isdir(base):
+            try:
+                kernels = os.listdir(base)
+            except OSError:
+                return False
+            if kernels:
+                return rel not in kernels
+    return False
+
+
 # --------------------------------------------------------------------------- #
-# Collector: keeps history and refreshes slow data in a background thread
+# Collector: keeps history and refreshes slow data in background threads
 # --------------------------------------------------------------------------- #
 class Collector:
     def __init__(self, public_ip=False):
@@ -633,6 +777,13 @@ class Collector:
         self.iface = None
         self.net_total = None
         self._net_last = None
+        self.disk_r_hist = deque(maxlen=120)
+        self.disk_w_hist = deque(maxlen=120)
+        self.disk_r = self.disk_w = 0.0
+        self.has_disk_io = False
+        self._disk_last = None
+        self.swap_in = self.swap_out = 0.0
+        self._swap_last = None
         self.top = []
         self.ntasks = 0
         self.cpu_name = cpu_model()
@@ -645,7 +796,12 @@ class Collector:
             "usb": (usb_devices, 5), "display": (display_info, 15), "ssid": (wifi_ssid, 10),
             "drive": (root_drive, 120), "pkgs": (count_packages, 3600),
             "shell": (shell_name, 3600), "nic": (lambda: nic_vendor(self.iface), 60),
+            "sensors": (self._sensors, 2), "reboot": (reboot_required, 30),
         }
+        if shutil.which("systemctl"):
+            self.slow_jobs["services"] = (failed_units, 30)
+        if UPDATES_SUPPORTED:
+            self.slow_jobs["updates"] = (pending_updates, 1800)
         if public_ip:
             self.slow_jobs["pubip"] = (fetch_public_ip, 300)
         psutil.cpu_percent(None)
@@ -663,12 +819,21 @@ class Collector:
                 except Exception:
                     self._slow.setdefault(key, None)
 
+    def _sensors(self):
+        d = self._slow.get("drive")
+        return sensor_data(d.get("dev") if isinstance(d, dict) else None)
+
     def start_background(self):
-        def loop():
+        # One thread per job, so a slow one (apt, bluetoothctl...) never delays the others.
+        def loop(key, fn, ttl):
             while True:
-                self.refresh_slow()
-                time.sleep(0.5)
-        threading.Thread(target=loop, daemon=True).start()
+                try:
+                    self._slow[key] = fn()
+                except Exception:
+                    self._slow.setdefault(key, None)
+                time.sleep(ttl)
+        for key, (fn, ttl) in self.slow_jobs.items():
+            threading.Thread(target=loop, args=(key, fn, ttl), daemon=True).start()
 
     def sample(self):
         self.cpu = psutil.cpu_percent(None)
@@ -698,6 +863,30 @@ class Collector:
             self.net_total = (counters.bytes_recv, counters.bytes_sent)
         else:
             self.net_total = None
+        io = disk_io_totals()
+        self.has_disk_io = io is not None
+        if io:
+            if self._disk_last:
+                t0, r0, w0 = self._disk_last
+                dt = max(now - t0, 1e-3)
+                self.disk_r = max(io[0] - r0, 0) / dt
+                self.disk_w = max(io[1] - w0, 0) / dt
+                self.disk_r_hist.append(self.disk_r)
+                self.disk_w_hist.append(self.disk_w)
+            self._disk_last = (now, io[0], io[1])
+        else:
+            self._disk_last = None
+            self.disk_r = self.disk_w = 0.0
+        try:
+            sm = psutil.swap_memory()
+            if self._swap_last:
+                t0, i0, o0 = self._swap_last
+                dt = max(now - t0, 1e-3)
+                self.swap_in = max(sm.sin - i0, 0) / dt
+                self.swap_out = max(sm.sout - o0, 0) / dt
+            self._swap_last = (now, sm.sin, sm.sout)
+        except Exception:
+            self._swap_last = None
         procs = []
         for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
             i = p.info
@@ -751,6 +940,13 @@ def tile_machine(c, w):
     return lines, 0
 
 
+def fan_text(fans):
+    shown = fans[:2]
+    t = txt(" / ".join(f"{f:.0f}" for f in shown), "faint" if all(f <= 0 for f in shown) else "bright")
+    t.append(" RPM", style=T["muted"])
+    return t
+
+
 def tile_cpu(c, w):
     freq = None
     try:
@@ -771,10 +967,15 @@ def tile_cpu(c, w):
     else:
         lines.append(kv("Temp", "–", w, "faint"))
     phys, logical = psutil.cpu_count(logical=False), psutil.cpu_count()
-    lines.append(kv("Cores", f"{phys}C / {logical}T" if phys else f"{logical}T", w))
+    cores = txt(f"{phys}C / {logical}T" if phys else f"{logical}T")
+    cores.append("  " + platform.machine(), style=T["faint"])
+    lines.append(kv("Cores", cores, w))
     la = os.getloadavg()
     lines.append(kv("Load", f"{la[0]:.2f}  {la[1]:.2f}  {la[2]:.2f}", w))
-    lines.append(kv("Arch", platform.machine(), w))
+    sd = c.get("sensors")
+    fans = sd.get("fans") if isinstance(sd, dict) else None
+    if fans:
+        lines.append(kv("Fan", fan_text(fans), w))
     lines.append(kv("Trend", spark(c.cpu_hist, max(w - LABEL_W, 4), 100, "blue"), w))
     return lines, level
 
@@ -826,7 +1027,19 @@ def tile_ram(c, w):
                              w, color=T["peach"] if sw.percent < 90 else T["crit"]))
     else:
         lines.append(kv("Swap", "none", w, "faint"))
-    return lines, sev(pct, 80, 92)
+    level = sev(pct, 80, 92)
+    mp = read_pressure("memory")
+    if mp and "some" in mp:
+        t = txt(f"{mp['some']:.1f}%", scolor(mp["some"], 10, 30))
+        if "full" in mp:
+            t.append(f"  full {mp['full']:.1f}%", style=T["faint"])
+        lines.append(kv("Pressure", t, w))
+        level = max(level, sev(mp["some"], 10, 30))
+    if sw.total:
+        lines.append(kv("Swap I/O", Text.assemble(
+            ("in ", T["muted"]), (f"{human_size(c.swap_in)}/s", T["bright"]),
+            ("  out ", T["muted"]), (f"{human_size(c.swap_out)}/s", T["bright"])), w))
+    return lines, level
 
 
 def tile_storage(c, w):
@@ -846,8 +1059,17 @@ def tile_storage(c, w):
         level = max(level, sev(u.percent, 85, 95))
     if len(mounts) > 4:
         lines.append(txt(f"+{len(mounts) - 4} more", "faint"))
+    if c.has_disk_io:
+        lines.append(rate_row("R", c.disk_r_hist, c.disk_r, "teal", w))
+        lines.append(rate_row("W", c.disk_w_hist, c.disk_w, "mauve", w))
     if drive and drive.get("kind"):
-        lines.append(kv("Drive", f"{drive['kind']} · {drive['fstype']}", w))
+        row = txt(f"{drive['kind']} · {drive['fstype']}")
+        sd = c.get("sensors")
+        dtemp = sd.get("drive_temp") if isinstance(sd, dict) else None
+        if dtemp is not None:
+            row.append(f"  {dtemp:.0f}°C", style=scolor(dtemp, 70, 80))
+            level = max(level, sev(dtemp, 70, 80))
+        lines.append(kv("Drive", row, w))
     return (lines or [txt("no disks found", "faint")]), level
 
 
@@ -918,12 +1140,31 @@ def tile_os(c, w):
     pkgs = c.get("pkgs")
     lines = [txt(osr.get("PRETTY_NAME") or platform.system(), bold=True),
              kv("Kernel", platform.release(), w),
-             kv("Uptime", fmt_duration(time.time() - psutil.boot_time()), w),
              kv("Shell", shell if shell not in (None, LOADING) else "–", w),
              kv("DE", de, w)]
     if pkgs not in (None, LOADING):
         lines.append(kv("Pkgs", pkgs, w))
-    return lines, 0
+    level = 0
+    if "updates" in c.slow_jobs:
+        up = c.get("updates")
+        if up is LOADING:
+            lines.append(kv("Updates", "checking…", w, "faint"))
+        elif up is not None:
+            lines.append(kv("Updates", txt("up to date", "ok") if up == 0 else txt(f"{up} available"), w))
+    if "services" in c.slow_jobs:
+        failed = c.get("services")
+        if failed is LOADING:
+            lines.append(kv("Services", "checking…", w, "faint"))
+        elif failed:
+            t = txt(f"{len(failed)} failed", "warn", bold=True)
+            t.append("  " + ", ".join(failed), style=T["faint"])
+            lines.append(kv("Services", t, w))
+            level = 1
+        elif failed is not None:
+            lines.append(kv("Services", "all OK", w, "ok"))
+    if c.get("reboot") is True:
+        lines.append(kv("Reboot", badge("REQUIRED", "warn"), w))
+    return lines, level
 
 
 def tile_processes(c, w):
