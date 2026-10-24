@@ -699,8 +699,16 @@ def audio_info():
                         cur = s[5:].strip()
                     elif s.startswith("Description:") and cur:
                         desc[cur] = s[12:].strip()
+            # Mic input gain + mute. A ".monitor" source is a loopback of the speakers, not a mic.
+            is_monitor = source.endswith(".monitor")
+            mic_vol = mic_muted = None
+            if source and not is_monitor:
+                mv = re.search(r"(\d+)%", run(["pactl", "get-source-volume", "@DEFAULT_SOURCE@"]) or "")
+                mic_vol = int(mv.group(1)) if mv else None
+                mic_muted = "yes" in (run(["pactl", "get-source-mute", "@DEFAULT_SOURCE@"]) or "")
             return dict(out=desc.get(sink, sink), vol=int(vol.group(1)) if vol else None,
-                        muted=muted, inp=desc.get(source, source) or None)
+                        muted=muted, inp=desc.get(source, source) or None,
+                        mic_vol=mic_vol, mic_muted=mic_muted, mic_monitor=is_monitor)
     out = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
     if out:
         m = re.search(r"([\d.]+)", out)
@@ -710,9 +718,13 @@ def audio_info():
             d = re.search(r'node\.description = "(.*)"', info)
             return d.group(1) if d else None
 
+        mic_out = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"])
+        mm = re.search(r"([\d.]+)", mic_out or "")
         return dict(out=node("@DEFAULT_AUDIO_SINK@") or "default output",
                     vol=round(float(m.group(1)) * 100) if m else None,
-                    muted="MUTED" in out, inp=node("@DEFAULT_AUDIO_SOURCE@"))
+                    muted="MUTED" in out, inp=node("@DEFAULT_AUDIO_SOURCE@"),
+                    mic_vol=round(float(mm.group(1)) * 100) if mm else None,
+                    mic_muted=("MUTED" in mic_out) if mic_out else None, mic_monitor=False)
     return None
 
 
@@ -1688,12 +1700,33 @@ def tile_audio(c, w):
     if not a:
         return [txt("no audio server found", "faint")], 0
     muted = a["muted"]
+    mic_muted = bool(a.get("mic_muted"))
     lines = [kv("Out", a["out"] or "–", w)]
     if a["vol"] is not None:
-        lines.append(bar_row("Vol", a["vol"], txt(f"{a['vol']:>3}%", "faint" if muted else "bright"), w,
+        lines.append(bar_row("Vol", min(a["vol"], 100),
+                             txt(f"{a['vol']:>3}%", "faint" if muted else "bright"), w,
                              color=T["faint"] if muted else T["blue"]))
     lines.append(kv("In", a["inp"] or "–", w))
-    lines.append(kv("Mute", badge("MUTED", "crit") if muted else txt("off", "faint"), w))
+    mic = a.get("mic_vol")
+    if a.get("mic_monitor"):
+        lines.append(kv("Mic", "no mic (monitor source)", w, "faint"))
+    elif mic is not None:
+        lines.append(bar_row("Mic", min(mic, 100),
+                             txt(f"{mic:>3}%", "faint" if mic_muted else "bright"), w,
+                             color=T["faint"] if mic_muted else T["mauve"]))
+    else:
+        lines.append(kv("Mic", "–", w, "faint"))
+    if muted or mic_muted:
+        t = Text()
+        if muted:
+            t.append_text(badge("MUTED", "crit"))
+        if mic_muted:
+            if muted:
+                t.append(" ")
+            t.append_text(badge("MIC MUTED", "crit"))
+        lines.append(kv("Mute", t, w))
+    else:
+        lines.append(kv("Mute", "off", w, "faint"))
     return lines, 0
 
 
