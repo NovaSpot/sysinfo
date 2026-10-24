@@ -4,9 +4,11 @@
 #   ./install.sh              auto: use what's installed, else distro packages, else a venv
 #   ./install.sh --venv       always use a private virtualenv (no root needed)
 #   ./install.sh --native     only use distro packages (fail if that isn't possible)
+#   ./install.sh --link       symlink sysinfo.py instead of copying (edits apply instantly)
 #   ./install.sh -y           don't ask before running the package manager
 #   ./install.sh --uninstall  remove what this script installed
 #
+# Run it as your normal user (it uses sudo only for the package manager).
 # Installs to:  ~/.local/share/sysinfo/   (script, optional venv)
 #               ~/.local/bin/sysinfo      (launcher)
 # Package managers are only run after showing you the exact command.
@@ -22,23 +24,31 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sysinfo.py"
 MODE=auto
 ASSUME_YES=0
 UNINSTALL=0
+LINK=0
 
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mxx\033[0m  %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 for arg in "$@"; do
     case "$arg" in
         --venv) MODE=venv ;;
         --native) MODE=native ;;
+        --link) LINK=1 ;;
         -y|--yes) ASSUME_YES=1 ;;
         --uninstall) UNINSTALL=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown option: $arg" ;;
     esac
 done
+
+# Under sudo, $HOME becomes /root and the launcher would land where your own user can't see it.
+if [ "$(id -u)" -eq 0 ] && [ "${SYSINFO_ALLOW_ROOT:-0}" != 1 ]; then
+    die "run this as your normal user, not root/sudo (it asks for sudo itself when needed). " \
+        "To really install for root, set SYSINFO_ALLOW_ROOT=1."
+fi
 
 # --------------------------------------------------------------------------- #
 # Uninstall
@@ -51,6 +61,8 @@ if [ "$UNINSTALL" = 1 ]; then
         rm -rf "$DATA_DIR"; say "removed $DATA_DIR"
     fi
     say "done (distro packages python3-rich / python3-psutil were left alone)"
+    warn "if the installer added a PATH line to your shell rc, remove the line after"
+    warn "the comment '# added by sysinfo install.sh' yourself; it isn't touched here."
     exit 0
 fi
 
@@ -69,9 +81,12 @@ SYS_PY=""
 [ -n "$PATH_PY" ] || [ -n "$SYS_PY" ] || \
     die "python3 not found. Install it first (e.g. 'sudo apt install python3')."
 
-# Base interpreter for the venv: prefer whatever is on PATH.
-BASE_PY="${PATH_PY:-$SYS_PY}"
-py_ok "$BASE_PY" || die "Python $MIN_PY or newer is required ($("$BASE_PY" -V 2>&1) found)."
+# Prefer the system interpreter: a python from an active venv / conda / pyenv can vanish later
+# and would leave the launcher pointing at nothing.
+BASE_PY="$SYS_PY"
+{ [ -n "$BASE_PY" ] && py_ok "$BASE_PY"; } || BASE_PY="$PATH_PY"
+[ -n "$BASE_PY" ] && py_ok "$BASE_PY" || \
+    die "Python $MIN_PY or newer is required (${BASE_PY:+$("$BASE_PY" -V 2>&1) }found)."
 
 # --------------------------------------------------------------------------- #
 # Distro detection
@@ -95,10 +110,14 @@ detect_family() {
     echo unknown
 }
 
+# The prompt goes to stderr and is printed separately, so hiding read's own errors
+# can't hide the question itself.
 confirm() {
     [ "$ASSUME_YES" = 1 ] && return 0
     local ans=""
-    if ! read -r -p "$1 [y/N] " ans </dev/tty 2>/dev/null; then
+    printf '%s [y/N] ' "$1" >&2
+    if ! { read -r ans </dev/tty; } 2>/dev/null; then
+        printf '\n' >&2
         warn "no terminal to ask on; re-run with -y to allow"
         return 1
     fi
@@ -127,7 +146,11 @@ try_native() {
     fi
     say "Will run: ${cmd[*]}"
     confirm "Proceed?" || return 1
-    "${cmd[@]}" || { warn "package install failed"; return 1; }
+    "${cmd[@]}" || {
+        warn "package install failed"
+        [ "$fam" = debian ] && warn "if it says the package wasn't found, try: sudo apt-get update"
+        return 1
+    }
 }
 
 # --------------------------------------------------------------------------- #
@@ -161,7 +184,7 @@ say "Detected distro family: $FAMILY"
 
 pick_existing() {
     local p
-    for p in "$PATH_PY" "$SYS_PY"; do
+    for p in "$SYS_PY" "$PATH_PY"; do
         if [ -n "$p" ] && py_ok "$p" && has_deps "$p"; then RUN_PY="$p"; return 0; fi
     done
     return 1
@@ -195,7 +218,13 @@ esac
 # Install script + launcher
 # --------------------------------------------------------------------------- #
 mkdir -p "$DATA_DIR" "$BIN_DIR"
-install -m 0755 "$SRC" "$DATA_DIR/sysinfo.py"
+if [ "$LINK" = 1 ]; then
+    ln -sf "$SRC" "$DATA_DIR/sysinfo.py"
+    say "Linked $DATA_DIR/sysinfo.py -> $SRC (edits apply immediately)"
+else
+    rm -f "$DATA_DIR/sysinfo.py"          # in case a previous --link left a symlink here
+    install -m 0755 "$SRC" "$DATA_DIR/sysinfo.py"
+fi
 cat > "$LAUNCHER" <<EOF
 #!/bin/sh
 exec "$RUN_PY" "$DATA_DIR/sysinfo.py" "\$@"
@@ -203,11 +232,14 @@ EOF
 chmod 0755 "$LAUNCHER"
 say "Installed $LAUNCHER (using $RUN_PY)"
 
-# Smoke test
-if "$LAUNCHER" --once >/dev/null 2>&1; then
+# Smoke test (the first snapshot runs every slow check, so give it time but not forever)
+SMOKE=""
+command -v timeout >/dev/null 2>&1 && SMOKE="timeout 90"
+say "Running a quick smoke test (can take a few seconds)..."
+if $SMOKE "$LAUNCHER" --once >/dev/null 2>&1; then
     say "Smoke test passed"
 else
-    warn "smoke test failed; run '$LAUNCHER --once' to see the error"
+    warn "smoke test failed or timed out; run '$LAUNCHER --once' to see the error"
 fi
 
 # --------------------------------------------------------------------------- #
