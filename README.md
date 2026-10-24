@@ -135,4 +135,4 @@ Bug reports and pull requests are welcome. When reporting a problem, please incl
 
 ## License
 
-MIT. See `LICENSE`. (Add a `LICENSE` file before publishing.)
+MIT. See `LICENSE`. 
