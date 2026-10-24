@@ -1088,6 +1088,7 @@ class Collector:
         self.periph_off = 0
         self.hitboxes = []
         self.flex = dict(FLEX)
+        self.tile_cache = {}
         self.cpu_name = cpu_model()
         self.ncpu = psutil.cpu_count() or 1
         self._slow = {}
@@ -1826,7 +1827,9 @@ def tile_len(t):
     return min(n, FLEX[t[0]]) if t[0] in FLEX else n
 
 
-def render(c, console, interval, theme, fill, interactive=False, mouse=False):
+def render(c, console, interval, theme, fill, interactive=False, mouse=False, light=False):
+    """light=True reuses the last output of tiles that don't react to input (used while
+    scrolling), so only the scrollable tiles are recomputed."""
     width, height = console.size
     cols = 4 if width >= 128 else 3 if width >= 96 else 2 if width >= 64 else 1
     base, extra = divmod(width - (cols - 1), cols)
@@ -1834,10 +1837,15 @@ def render(c, console, interval, theme, fill, interactive=False, mouse=False):
     tiles = []
     for name, fn in TILES:
         w = widths[len(tiles) % cols] - 4
-        try:
-            res = fn(c, w)
-        except Exception:
-            res = ([txt("unavailable", "faint")], 0)
+        cached = c.tile_cache.get(name)
+        if light and cached and cached[0] == w and name not in FLEX and name != "Storage":
+            res = cached[1]
+        else:
+            try:
+                res = fn(c, w)
+            except Exception:
+                res = ([txt("unavailable", "faint")], 0)
+            c.tile_cache[name] = (w, res)
         if res is not None:
             tiles.append((name, res[0], res[1], res[2] if len(res) > 2 else ""))
     rows = [tiles[i:i + cols] for i in range(0, len(tiles), cols)]
@@ -1922,9 +1930,9 @@ def main():
         with Keys(mouse=not args.no_mouse) as keys, \
                 Live(console=console, screen=True, auto_refresh=False,
                      vertical_overflow="crop") as live:
-            def draw():
+            def draw(light=False):
                 live.update(render(c, console, args.interval, args.theme, True,
-                                   keys.active, keys.mouse), refresh=True)
+                                   keys.active, keys.mouse, light), refresh=True)
 
             while True:
                 c.sample()
@@ -1934,11 +1942,18 @@ def main():
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break
-                    for kind, val, x, y in keys.wait(left):
+                    events = keys.wait(left)
+                    while events:                    # drain anything already queued
+                        more = keys.wait(0)
+                        if not more:
+                            break
+                        events += more
+                    for kind, val, x, y in events:
                         if kind == "quit":
                             return 0
                         c.handle(kind, val, x, y)
-                        draw()
+                    if events:
+                        draw(light=True)             # one redraw for the whole burst
     except KeyboardInterrupt:
         pass
     return 0
