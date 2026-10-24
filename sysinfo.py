@@ -4,7 +4,8 @@
     sysinfo.py                  live dashboard (refreshes every 2s), Ctrl+C to exit
     sysinfo.py --once           print one snapshot and exit
     sysinfo.py -i 1 --theme tokyo
-    sysinfo.py --public-ip      also look up your public IP (off by default)
+    sysinfo.py --public-ip      look up + show your public IP at start (otherwise it stays
+                                hidden as a spoiler; reveal it with a click or `p`)
     sysinfo.py --disk sda       start the Storage tile on a specific drive
     sysinfo.py --no-mouse       don't capture the mouse (keeps normal text selection)
 
@@ -15,6 +16,7 @@ Live mode controls:
                      row to toggle CPU / memory sorting
     j / k, Up / Down, PgUp / PgDn   scroll the focused tile (Processes by default)
     s                toggle process sort (CPU <-> memory)
+    p, or click the Pub. IP row   reveal / hide the public IP (looked up only on first reveal)
     [ and ]  (or Tab / Left / Right)   switch drive in the Storage tile
     q or Ctrl+C      quit
 With mouse capture on, hold Shift to select text in most terminals.
@@ -997,7 +999,7 @@ _KEYMAP = {"]": ("next", 0), ".": ("next", 0), "\t": ("next", 0),
            "[": ("prev", 0), ",": ("prev", 0), "\x1b[Z": ("prev", 0),
            "\x1b[D": ("prev", 0), "\x1bOD": ("prev", 0),
            "q": ("quit", 0), "Q": ("quit", 0),
-           "s": ("sort", 0), "S": ("sort", 0),
+           "s": ("sort", 0), "S": ("sort", 0), "p": ("pub", 0), "P": ("pub", 0),
            "j": ("line", 1), "\x1b[B": ("line", 1), "\x1bOB": ("line", 1),
            "k": ("line", -1), "\x1b[A": ("line", -1), "\x1bOA": ("line", -1),
            "\x1b[6~": ("line", 5), "\x1b[5~": ("line", -5)}
@@ -1101,6 +1103,10 @@ class Collector:
         self.hitboxes = []
         self.flex = dict(FLEX)
         self.tile_cache = {}
+        self.pub_reveal = public_ip       # public IP is a spoiler unless --public-ip
+        self.pub_row = None
+        self.mouse_on = False
+        self._bg = False
         self.cpu_name = cpu_model()
         self.ncpu = psutil.cpu_count() or 1
         self._slow = {}
@@ -1146,6 +1152,20 @@ class Collector:
                 return box
         return None
 
+    def start_pub(self):
+        """Register the public-IP lookup the first time it's needed (nothing is sent before)."""
+        if "pubip" in self.slow_jobs:
+            return
+        self.slow_jobs["pubip"] = (fetch_public_ip, 300)
+        if self._bg:
+            self._spawn("pubip")
+
+    def toggle_pub(self):
+        self.pub_reveal = not self.pub_reveal
+        if self.pub_reveal:
+            self.start_pub()
+        self.tile_cache.pop("Network", None)     # the Network tile is cached while scrolling
+
     def toggle_sort(self):
         self.sort = "mem" if self.sort == "cpu" else "cpu"
         self.proc_off = 0
@@ -1164,12 +1184,17 @@ class Collector:
             self.cycle_disk(1 if kind == "next" else -1)
         elif kind == "sort":
             self.toggle_sort()
+        elif kind == "pub":
+            self.toggle_pub()
         elif kind == "click":
             box = self.tile_at(x, y)
             self.focus = box[0] if box else None
             # Row y0+2 of the Processes tile is its column-header line.
             if box and box[0] == "Processes" and y == box[2] + 2:
                 self.toggle_sort()
+            elif (box and box[0] == "Network" and self.pub_row is not None
+                  and y == box[2] + 1 + self.pub_row):
+                self.toggle_pub()
         elif kind == "scroll":
             box = self.tile_at(x, y)
             if box:
@@ -1194,17 +1219,23 @@ class Collector:
     def _sensors(self):
         return dict(fans=fan_speeds())
 
-    def start_background(self):
-        # One thread per job, so a slow one (apt, bluetoothctl...) never delays the others.
-        def loop(key, fn, ttl):
+    def _spawn(self, key):
+        fn, ttl = self.slow_jobs[key]
+
+        def loop():
             while True:
                 try:
                     self._slow[key] = fn()
                 except Exception:
                     self._slow.setdefault(key, None)
                 time.sleep(ttl)
-        for key, (fn, ttl) in self.slow_jobs.items():
-            threading.Thread(target=loop, args=(key, fn, ttl), daemon=True).start()
+        threading.Thread(target=loop, daemon=True).start()
+
+    def start_background(self):
+        # One thread per job, so a slow one (apt, bluetoothctl...) never delays the others.
+        self._bg = True
+        for key in list(self.slow_jobs):
+            self._spawn(key)
 
     def _sort_top(self):
         if self.sort == "mem":
@@ -1562,10 +1593,15 @@ def tile_network(c, w):
         ssid = c.get("ssid")
         if ssid not in (None, LOADING):
             lines.append(kv("SSID", ssid, w))
-    if c.public_ip:
+    c.pub_row = len(lines)
+    if c.pub_reveal:
         pub = c.get("pubip")
         lines.append(kv("Pub. IP", "…" if pub is LOADING else (pub or "–"), w,
                         "bright" if pub not in (None, LOADING) else "faint"))
+    else:
+        t = Text("▒" * 12, style=T["faint"])
+        t.append("  click / p to reveal" if c.mouse_on else "  p to reveal", style=T["faint"])
+        lines.append(kv("Pub. IP", t, w))
     ip = "–"
     for a in psutil.net_if_addrs().get(c.iface, []):
         if a.family == socket.AF_INET:
@@ -1827,6 +1863,8 @@ def footer(interval, theme, interactive, multi_disk, mouse):
     if interactive:
         hint.append("   s", style=key)
         hint.append(" sort", style=T["muted"])
+        hint.append("   p", style=key)
+        hint.append(" ip", style=T["muted"])
         hint.append("   wheel" if mouse else "   j/k", style=key)
         hint.append(" scroll", style=T["muted"])
         if mouse:
@@ -1934,7 +1972,8 @@ def main():
     ap.add_argument("--disk", metavar="NAME",
                     help="start the Storage tile on this drive, e.g. nvme0n1 (switch live with [ and ])")
     ap.add_argument("--public-ip", action="store_true",
-                    help="look up public IP via api.ipify.org (off by default)")
+                    help="look up public IP via api.ipify.org at start and show it "
+                         "(default: hidden, looked up only when you reveal it)")
     ap.add_argument("--no-mouse", action="store_true",
                     help="don't capture the mouse (normal text selection; scroll with j/k)")
     args = ap.parse_args()
@@ -1963,6 +2002,8 @@ def main():
         with Keys(mouse=not args.no_mouse) as keys, \
                 Live(console=console, screen=True, auto_refresh=False,
                      vertical_overflow="crop") as live:
+            c.mouse_on = keys.mouse
+
             def draw(light=False):
                 live.update(render(c, console, args.interval, args.theme, True,
                                    keys.active, keys.mouse, light), refresh=True)
